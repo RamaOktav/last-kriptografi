@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Secret Note — Catatan Terenkripsi</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Google Fonts: Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <!-- Custom CSS tambahan -->
+  <link rel="stylesheet" href="style.css" />
+  <!-- Tailwind config kustom -->
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'ui-sans-serif', 'system-ui'] },
+          colors: {
+            primary: { DEFAULT: '#2563eb', dark: '#1d4ed8', light: '#3b82f6', muted: '#dbeafe' },
+            accent:  { DEFAULT: '#f97316', dark: '#ea580c', light: '#fb923c', muted: '#ffedd5' },
+            surface: '#f8fafc',
+            border:  '#e2e8f0',
+          },
+          boxShadow: {
+            card: '0 2px 12px 0 rgba(30,41,59,.07)',
+            modal: '0 8px 40px 0 rgba(30,41,59,.18)',
+          }
+        }
+      }
+    };
+  </script>
+</head>
+<body class="bg-surface font-sans text-slate-800 min-h-screen">
+
+<!-- ══════════════════════════════════════
+     LAYAR LOCK — Muncul di awal sebelum login
+══════════════════════════════════════ -->
+<section id="lockScreen"
+  class="fixed inset-0 z-50 flex flex-col items-center justify-center bg-gradient-to-br from-slate-900 via-blue-950 to-slate-900 px-4">
+
+  <!-- Logo & judul -->
+  <div class="mb-8 flex flex-col items-center gap-3">
+    <div class="w-16 h-16 rounded-2xl bg-primary flex items-center justify-center shadow-lg">
+      <!-- ikon kunci -->
+      <svg width="32" height="32" fill="none" stroke="white" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round"
+          d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+      </svg>
+    </div>
+    <h1 class="text-3xl font-bold text-white tracking-tight">Secret Note</h1>
+    <p class="text-slate-400 text-sm text-center max-w-xs">
+      Catatan terenkripsi pribadi Anda. Masuk dengan kata sandi atau pindai wajah untuk membuka.
+    </p>
+  </div>
+
+  <!-- Kartu login -->
+  <div class="w-full max-w-sm bg-white/5 backdrop-blur border border-white/10 rounded-2xl p-6 shadow-modal">
+
+    <!-- Tab pilih metode login -->
+    <div class="flex rounded-lg bg-white/5 p-1 mb-5 gap-1" role="tablist" aria-label="Metode masuk">
+      <button id="tabPassword" role="tab"
+        class="flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200
+               bg-primary text-white"
+        onclick="switchLockTab('password')">
+        Kata Sandi
+      </button>
+      <button id="tabFace" role="tab"
+        class="flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200
+               text-slate-400 hover:text-white"
+        onclick="switchLockTab('face')">
+        Pindai Wajah
+      </button>
+    </div>
+
+    <!-- Panel: Login Kata Sandi -->
+    <div id="panelPassword">
+      <div class="mb-4">
+        <label for="masterPassword" class="block text-slate-300 text-xs font-medium mb-1.5">
+          Kata Sandi Master
+        </label>
+        <input id="masterPassword" type="password" placeholder="Masukkan kata sandi…"
+          class="w-full px-3 py-2.5 rounded-lg bg-white/10 border border-white/15
+                 text-white placeholder-slate-500 text-sm
+                 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent
+                 transition-all duration-200"
+          onkeydown="if(event.key==='Enter') unlockWithPassword()" />
+      </div>
+      <!-- Peringatan salah kata sandi -->
+      <div id="passwordWarning"
+        class="hidden mb-3 px-3 py-2 rounded-lg bg-red-600 text-white text-xs font-medium">
+        Kata sandi salah. Periksa kembali dan coba lagi.
+      </div>
+      <button onclick="unlockWithPassword()"
+        class="w-full py-2.5 rounded-lg bg-primary hover:bg-primary-dark active:scale-95
+               text-white font-semibold text-sm transition-all duration-200">
+        Buka Kunci
+      </button>
+      <p class="text-center text-slate-500 text-xs mt-4">
+        Belum punya kata sandi?
+        <button onclick="openSetupModal()" class="text-primary-light underline ml-1 hover:text-white transition-colors">
+          Atur sekarang
+        </button>
+      </p>
+    </div>
+
+    <!-- Panel: Login Face Scan -->
+    <div id="panelFace" class="hidden">
+      <div id="faceVideoContainer"
+        class="relative w-full aspect-video rounded-xl overflow-hidden bg-black border border-white/10 mb-4">
+        <video id="faceVideo" autoplay muted playsinline
+          class="w-full h-full object-cover"></video>
+        <canvas id="faceCanvas" class="absolute inset-0 w-full h-full"></canvas>
+        <!-- Overlay panduan -->
+        <div id="faceScanGuide"
+          class="absolute inset-0 flex flex-col items-center justify-center text-white/60 text-xs gap-2 pointer-events-none">
+          <svg width="56" height="56" fill="none" stroke="currentColor" stroke-width="1.2"
+            viewBox="0 0 24 24" opacity=".4" aria-hidden="true">
+            <path stroke-linecap="round" d="M5.75 4.75h-1a2 2 0 00-2 2v1M18.25 4.75h1a2 2 0 012 2v1M5.75 19.25h-1a2 2 0 01-2-2v-1M18.25 19.25h1a2 2 0 002-2v-1"/>
+            <circle cx="12" cy="12" r="4"/>
+          </svg>
+          <span id="faceStatusText">Memuat model…</span>
+        </div>
+      </div>
+      <!-- Peringatan face scan gagal -->
+      <div id="faceWarning"
+        class="hidden mb-3 px-3 py-2 rounded-lg bg-orange-600 text-white text-xs font-medium">
+        Wajah tidak dikenali. Pastikan cahaya cukup dan wajah terdaftar.
+      </div>
+      <button id="faceStartBtn" onclick="startFaceScan()"
+        class="w-full py-2.5 rounded-lg bg-accent hover:bg-accent-dark active:scale-95
+               text-white font-semibold text-sm transition-all duration-200">
+        Mulai Pindai Wajah
+      </button>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════
+     NAVBAR (muncul setelah unlock)
+══════════════════════════════════════ -->
+<nav id="navbar"
+  class="hidden sticky top-0 z-40 w-full bg-white border-b border-border shadow-card px-4 sm:px-6 h-14 flex items-center justify-between"
+  role="banner">
+  <div class="flex items-center gap-2.5">
+    <div class="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
+      <svg width="16" height="16" fill="none" stroke="white" stroke-width="2.2" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round"
+          d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+      </svg>
+    </div>
+    <span class="text-base font-bold text-slate-800 tracking-tight">Secret Note</span>
+  </div>
+  <div class="flex items-center gap-2">
+    <!-- Tombol kunci ulang -->
+    <button onclick="lockApp()"
+      class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
+             text-slate-500 hover:text-red-600 hover:bg-red-50 transition-all duration-200"
+      aria-label="Kunci aplikasi">
+      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round"
+          d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+      </svg>
+      Kunci
+    </button>
+  </div>
+</nav>
+
+<!-- ══════════════════════════════════════
+     MAIN CONTENT (muncul setelah unlock)
+══════════════════════════════════════ -->
+<main id="mainContent" class="hidden max-w-5xl mx-auto px-4 sm:px-6 py-6" role="main">
+
+  <!-- TABS navigasi utama -->
+  <div class="flex gap-1 bg-white border border-border rounded-xl p-1 mb-6 shadow-card overflow-x-auto"
+    role="tablist" aria-label="Navigasi fitur">
+    <button class="nav-tab active" id="navNote"   onclick="switchMainTab('note',   this)" role="tab" aria-selected="true">
+      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+      </svg>
+      Catatan
+    </button>
+    <button class="nav-tab" id="navFile"   onclick="switchMainTab('file',   this)" role="tab" aria-selected="false">
+      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/>
+      </svg>
+      File Terenkripsi
+    </button>
+    <button class="nav-tab" id="navBio"    onclick="switchMainTab('bio',    this)" role="tab" aria-selected="false">
+      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M5.121 17.804A13.937 13.937 0 0112 16c2.5 0 4.847.655 6.879 1.804M15 10a3 3 0 11-6 0 3 3 0 016 0z"/>
+        <path stroke-linecap="round" stroke-linejoin="round" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/>
+      </svg>
+      Biometrik
+    </button>
+  </div>
+
+  <!-- ═══ TAB: CATATAN TERENKRIPSI ═══ -->
+  <section id="tab-note" class="space-y-4" role="tabpanel" aria-label="Catatan Terenkripsi">
+
+    <!-- Toolbar catatan -->
+    <div class="flex flex-col sm:flex-row gap-3 items-start sm:items-center justify-between">
+      <div class="relative flex-1 w-full sm:max-w-xs">
+        <svg class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" width="14" height="14"
+          fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="11" cy="11" r="8"/><path stroke-linecap="round" d="M21 21l-4.35-4.35"/>
+        </svg>
+        <input type="search" id="noteSearch" placeholder="Cari catatan…"
+          oninput="renderNoteList()"
+          class="w-full pl-9 pr-4 py-2 text-sm rounded-lg border border-border bg-white
+                 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-all"
+          aria-label="Cari catatan" />
+      </div>
+      <button onclick="openNoteEditor(null)"
+        class="flex items-center gap-2 px-4 py-2 rounded-lg bg-primary hover:bg-primary-dark
+               text-white text-sm font-semibold transition-all duration-200 active:scale-95 shrink-0">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24" aria-hidden="true">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4"/>
+        </svg>
+        Catatan Baru
+      </button>
+    </div>
+
+    <!-- Daftar catatan -->
+    <div id="noteList" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+    <p id="noteEmpty" class="hidden text-center text-slate-400 text-sm py-12">
+      Belum ada catatan. Buat catatan pertama Anda.
+    </p>
+  </section>
+
+  <!-- ═══ TAB: FILE TERENKRIPSI ═══ -->
+  <section id="tab-file" class="hidden space-y-4" role="tabpanel" aria-label="File Terenkripsi">
+
+    <!-- Area upload file -->
+    <div id="fileDropZone"
+      class="border-2 border-dashed border-primary/40 rounded-xl p-8 flex flex-col items-center
+             justify-center gap-3 cursor-pointer hover:border-primary hover:bg-primary/5
+             transition-all duration-200 bg-white"
+      onclick="document.getElementById('fileInput').click()"
+      ondragover="handleFileDragOver(event)"
+      ondragleave="handleFileDragLeave(event)"
+      ondrop="handleFileDrop(event)"
+      role="button" tabindex="0" aria-label="Pilih file untuk dienkripsi">
+      <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5"
+        class="text-primary/50" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round"
+          d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+      </svg>
+      <div class="text-center">
+        <p class="text-sm font-medium text-slate-700">Klik atau seret file ke sini</p>
+        <p class="text-xs text-slate-400 mt-1">Semua format file didukung — maks 50 MB</p>
+      </div>
+      <input type="file" id="fileInput" class="hidden" onchange="handleFileSelect(event)" multiple />
+    </div>
+
+    <!-- Peringatan file besar -->
+    <div id="fileSizeWarning"
+      class="hidden px-4 py-3 rounded-lg bg-orange-500 text-white text-sm font-medium">
+      File melebihi batas 50 MB. Pilih file yang lebih kecil.
+    </div>
+
+    <!-- Daftar file terenkripsi -->
+    <div id="fileList" class="space-y-2"></div>
+    <p id="fileEmpty" class="hidden text-center text-slate-400 text-sm py-12">
+      Belum ada file terenkripsi.
+    </p>
+  </section>
+
+  <!-- ═══ TAB: PENGATURAN BIOMETRIK ═══ -->
+  <section id="tab-bio" class="hidden" role="tabpanel" aria-label="Pengaturan Biometrik">
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+      <!-- Kartu: Daftarkan Wajah -->
+      <div class="bg-white rounded-2xl border border-border shadow-card p-5">
+        <h2 class="text-base font-semibold text-slate-800 mb-1">Daftarkan Wajah</h2>
+        <p class="text-xs text-slate-500 mb-4">Rekam data wajah Anda agar bisa login tanpa kata sandi.</p>
+
+        <div class="relative w-full aspect-video rounded-xl overflow-hidden bg-slate-900 mb-4">
+          <video id="bioVideo" autoplay muted playsinline class="w-full h-full object-cover"></video>
+          <canvas id="bioCanvas" class="absolute inset-0 w-full h-full"></canvas>
+          <p id="bioStatusText" class="absolute bottom-3 left-0 right-0 text-center text-white/70 text-xs pointer-events-none">
+            Kamera belum aktif
+          </p>
+        </div>
+
+        <!-- Peringatan registrasi wajah gagal -->
+        <div id="bioRegisterWarning"
+          class="hidden mb-3 px-3 py-2 rounded-lg bg-orange-500 text-white text-xs font-medium">
+          Wajah tidak terdeteksi. Pastikan wajah terlihat jelas di kamera.
+        </div>
+
+        <div class="flex gap-2">
+          <button onclick="startBioCamera()"
+            class="flex-1 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700
+                   text-sm font-medium transition-all duration-200 active:scale-95">
+            Aktifkan Kamera
+          </button>
+          <button onclick="registerFace()"
+            class="flex-1 py-2 rounded-lg bg-primary hover:bg-primary-dark text-white
+                   text-sm font-semibold transition-all duration-200 active:scale-95">
+            Daftarkan Wajah
+          </button>
+        </div>
+      </div>
+
+      <!-- Kartu: Status & Pengaturan -->
+      <div class="bg-white rounded-2xl border border-border shadow-card p-5 flex flex-col gap-4">
+        <div>
+          <h2 class="text-base font-semibold text-slate-800 mb-1">Status Biometrik</h2>
+          <p class="text-xs text-slate-500 mb-3">Kelola data wajah yang tersimpan.</p>
+          <div id="bioStatusCard"
+            class="flex items-center gap-3 px-4 py-3 rounded-xl bg-slate-50 border border-border">
+            <div id="bioStatusDot" class="w-2.5 h-2.5 rounded-full bg-slate-300 shrink-0"></div>
+            <p id="bioStatusMsg" class="text-sm text-slate-600">Belum ada data wajah terdaftar.</p>
+          </div>
+        </div>
+        <div class="border-t border-border pt-4">
+          <!-- Peringatan hapus data wajah -->
+          <div id="bioDeleteWarning"
+            class="hidden mb-3 px-3 py-2 rounded-lg bg-red-600 text-white text-xs font-medium">
+            Data wajah dihapus. Login face scan tidak lagi tersedia.
+          </div>
+          <button onclick="deleteFaceData()"
+            class="w-full py-2 rounded-lg border border-red-200 text-red-600 text-sm font-medium
+                   hover:bg-red-50 transition-all duration-200 active:scale-95">
+            Hapus Data Wajah
+          </button>
+        </div>
+
+        <!-- Ubah kata sandi master -->
+        <div class="border-t border-border pt-4">
+          <h3 class="text-sm font-semibold text-slate-700 mb-2">Ubah Kata Sandi Master</h3>
+          <div class="space-y-2">
+            <input type="password" id="newPasswordInput" placeholder="Kata sandi baru…"
+              class="w-full px-3 py-2 text-sm rounded-lg border border-border bg-slate-50
+                     focus:outline-none focus:ring-2 focus:ring-primary transition-all" />
+            <input type="password" id="confirmPasswordInput" placeholder="Konfirmasi kata sandi…"
+              class="w-full px-3 py-2 text-sm rounded-lg border border-border bg-slate-50
+                     focus:outline-none focus:ring-2 focus:ring-primary transition-all" />
+            <!-- Peringatan kata sandi tidak cocok -->
+            <div id="passwordMismatchWarning"
+              class="hidden px-3 py-2 rounded-lg bg-red-600 text-white text-xs font-medium">
+              Kata sandi tidak cocok. Periksa kembali.
+            </div>
+            <button onclick="changePassword()"
+              class="w-full py-2 rounded-lg bg-primary hover:bg-primary-dark text-white
+                     text-sm font-semibold transition-all duration-200 active:scale-95">
+              Simpan Kata Sandi Baru
+            </button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+</main>
+
+<!-- ══════════════════════════════════════
+     TOAST NOTIFICATIONS
+══════════════════════════════════════ -->
+<div id="toastContainer"
+  class="fixed bottom-5 right-5 z-[200] flex flex-col gap-2 pointer-events-none"
+  role="status" aria-live="polite"></div>
+
+<!-- ══════════════════════════════════════
+     MODAL: EDITOR CATATAN
+══════════════════════════════════════ -->
+<div id="noteModal"
+  class="hidden fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm px-4"
+  role="dialog" aria-modal="true" aria-labelledby="noteModalTitle">
+  <div class="bg-white w-full max-w-lg rounded-2xl shadow-modal p-6 relative">
+    <button onclick="closeNoteEditor()"
+      class="absolute top-4 right-4 p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-all"
+      aria-label="Tutup editor catatan">
+      <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+      </svg>
+    </button>
+
+    <h2 id="noteModalTitle" class="text-lg font-bold text-slate-800 mb-4 pr-8">Catatan Baru</h2>
+
+    <input type="hidden" id="noteEditId" />
+    <div class="space-y-3">
+      <input type="text" id="noteTitle" placeholder="Judul catatan…"
+        class="w-full px-3 py-2.5 rounded-lg border border-border text-sm
+               focus:outline-none focus:ring-2 focus:ring-primary transition-all" />
+      <textarea id="noteContent" rows="7" placeholder="Isi catatan Anda…"
+        class="w-full px-3 py-2.5 rounded-lg border border-border text-sm resize-none
+               focus:outline-none focus:ring-2 focus:ring-primary transition-all"></textarea>
+
+      <!-- Indikator enkripsi aktif -->
+      <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-primary/5 border border-primary/20">
+        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"
+          class="text-primary shrink-0" aria-hidden="true">
+          <path stroke-linecap="round" stroke-linejoin="round"
+            d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+        </svg>
+        <span class="text-xs text-primary font-medium">Catatan akan dienkripsi otomatis dengan AES-256-GCM</span>
+      </div>
+    </div>
+
+    <div class="flex justify-end gap-2 mt-5">
+      <button onclick="closeNoteEditor()"
+        class="px-4 py-2 rounded-lg border border-border text-slate-600 text-sm font-medium
+               hover:bg-slate-50 transition-all duration-200">
+        Batal
+      </button>
+      <button onclick="saveNote()"
+        class="px-4 py-2 rounded-lg bg-primary hover:bg-primary-dark text-white text-sm font-semibold
+               transition-all duration-200 active:scale-95">
+        Enkripsi &amp; Simpan
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════
+     MODAL: SETUP KATA SANDI (pertama kali)
+══════════════════════════════════════ -->
+<div id="setupModal"
+  class="hidden fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/70 backdrop-blur-sm px-4"
+  role="dialog" aria-modal="true" aria-labelledby="setupModalTitle">
+  <div class="bg-white w-full max-w-sm rounded-2xl shadow-modal p-6">
+    <h2 id="setupModalTitle" class="text-lg font-bold text-slate-800 mb-1">Atur Kata Sandi Master</h2>
+    <p class="text-xs text-slate-500 mb-4">
+      Kata sandi ini digunakan sebagai kunci enkripsi. Jangan sampai lupa — tidak bisa dipulihkan.
+    </p>
+
+    <!-- Peringatan: kata sandi terlalu pendek -->
+    <div id="setupWarning"
+      class="hidden mb-3 px-3 py-2 rounded-lg bg-red-600 text-white text-xs font-medium">
+      Kata sandi minimal 8 karakter.
+    </div>
+
+    <div class="space-y-3">
+      <input type="password" id="setupPassword" placeholder="Kata sandi master baru…"
+        class="w-full px-3 py-2.5 rounded-lg border border-border text-sm
+               focus:outline-none focus:ring-2 focus:ring-primary transition-all" />
+      <input type="password" id="setupConfirm" placeholder="Konfirmasi kata sandi…"
+        class="w-full px-3 py-2.5 rounded-lg border border-border text-sm
+               focus:outline-none focus:ring-2 focus:ring-primary transition-all" />
+    </div>
+
+    <div class="flex justify-end gap-2 mt-5">
+      <button onclick="closeSetupModal()"
+        class="px-4 py-2 rounded-lg border border-border text-slate-600 text-sm font-medium hover:bg-slate-50 transition-all">
+        Batal
+      </button>
+      <button onclick="saveSetupPassword()"
+        class="px-4 py-2 rounded-lg bg-primary hover:bg-primary-dark text-white text-sm font-semibold
+               transition-all duration-200 active:scale-95">
+        Simpan
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════
+     MODAL: LIHAT CATATAN TERDEKRIPSI
+══════════════════════════════════════ -->
+<div id="viewNoteModal"
+  class="hidden fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm px-4"
+  role="dialog" aria-modal="true" aria-labelledby="viewNoteTitle">
+  <div class="bg-white w-full max-w-lg rounded-2xl shadow-modal p-6 relative">
+    <button onclick="closeViewNote()"
+      class="absolute top-4 right-4 p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-all"
+      aria-label="Tutup">
+      <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+      </svg>
+    </button>
+    <h2 id="viewNoteTitle" class="text-lg font-bold text-slate-800 mb-3 pr-8"></h2>
+    <div id="viewNoteContent"
+      class="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap max-h-72 overflow-y-auto
+             px-3 py-3 rounded-lg bg-slate-50 border border-border"></div>
+    <p class="mt-3 text-xs text-slate-400">Disimpan: <span id="viewNoteDate"></span></p>
+    <div class="flex justify-end gap-2 mt-4">
+      <button id="viewNoteEditBtn"
+        class="px-4 py-2 rounded-lg bg-primary hover:bg-primary-dark text-white text-sm font-semibold transition-all active:scale-95">
+        Edit
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════
+     SCRIPTS
+     Urutan penting: face-api.js harus dimuat
+     sebelum face-scan.js dan app.js
+══════════════════════════════════════ -->
+<script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+<script src="crypto.js"></script>
+<script src="file-crypto.js"></script>
+<script src="face-scan.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
