@@ -1,228 +1,101 @@
 /**
  * file-crypto.js — Secret Note
- * Module enkripsi & dekripsi file menggunakan Web Crypto API (AES-256-GCM).
- * File diproses sebagai ArrayBuffer di browser — tidak ada upload ke server.
+ * Enkripsi berkas dengan RC4 (stream cipher), berbeda dari algoritma teks (Vigenère + AES).
+ * Dilengkapi trace KSA / PRGA / XOR untuk visualisasi presentasi.
  *
- * Format payload terenkripsi:
- *   [salt (16B) | iv (12B) | filenameLength (4B, uint32) | filename (UTF-8) | ciphertext]
- *
- * Semua file tersimpan di localStorage sebagai base64, bersama metadata:
- *   { id, originalName, encryptedType, size, encryptedAt, payloadB64 }
+ * Format plaintext sebelum dienkripsi RC4:
+ *   "RC4F"(4B magic) | nameLen(uint16 BE) | nama file (UTF-8) | data file
+ * Magic dipakai untuk mendeteksi kunci yang salah saat dekripsi.
  */
-
 'use strict';
 
-// ── Konstanta ─────────────────────────────────────────────────────────────────
-const FILE_SALT_BYTES = 16;
-const FILE_IV_BYTES   = 12;
-const MAX_FILE_BYTES  = 50 * 1024 * 1024; // 50 MB
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
+const FILE_MAGIC = [0x52, 0x43, 0x34, 0x46]; // "RC4F"
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+const RC4_TRACE_SAMPLE = 16;
+const RC4_TRACE_ROWS = 10;
 
 /**
- * Mengkonversi ArrayBuffer menjadi string base64.
- * @param {ArrayBuffer} buffer
- * @returns {string}
+ * RC4: KSA + PRGA. Simetris — enkripsi dan dekripsi memakai fungsi yang sama.
+ * @param {boolean} withTrace  jika true, kembalikan {out, trace}
  */
-function bufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let bin = '';
-  // Gunakan chunk agar tidak overflow call stack pada file besar
-  const chunkSize = 8192;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+function rc4Core(keyBytes, data, withTrace) {
+  if (!keyBytes.length) throw new Error('Kunci RC4 tidak boleh kosong.');
+  const S = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) S[i] = i;
+  const trace = withTrace ? { keyBytes: Array.from(keyBytes), sBefore: Array.from(S.slice(0, RC4_TRACE_SAMPLE)), keystream: [], rows: [] } : null;
+  // KSA
+  let j = 0;
+  for (let i = 0; i < 256; i++) {
+    j = (j + S[i] + keyBytes[i % keyBytes.length]) & 255;
+    [S[i], S[j]] = [S[j], S[i]];
   }
-  return btoa(bin);
-}
-
-/**
- * Mengkonversi string base64 menjadi ArrayBuffer.
- * @param {string} b64
- * @returns {ArrayBuffer}
- */
-function base64ToBuffer(b64) {
-  const bin   = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes.buffer;
-}
-
-/**
- * Menurunkan CryptoKey dari kata sandi + salt (PBKDF2 → AES-256-GCM).
- * Menggunakan fungsi yang sama persis dengan crypto.js untuk konsistensi.
- * @param {string}     password
- * @param {Uint8Array} salt
- * @returns {Promise<CryptoKey>}
- */
-async function deriveFileKey(password, salt) {
-  const baseKey = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(password),
-    { name: 'PBKDF2' },
-    false,
-    ['deriveKey']
-  );
-  return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: 200_000, hash: 'SHA-256' },
-    baseKey,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
-// ── API Publik ────────────────────────────────────────────────────────────────
-
-/**
- * Mengenkripsi sebuah File dan menyimpannya ke localStorage.
- * Memanggil onProgress(percent) secara berkala selama proses berlangsung.
- *
- * @param {File}     file         - File yang akan dienkripsi
- * @param {string}   password     - Kata sandi master
- * @param {Function} onProgress   - Callback progress (0–100)
- * @returns {Promise<Object>}     - Metadata file terenkripsi
- */
-async function encryptFile(file, password, onProgress = () => {}) {
-  if (file.size > MAX_FILE_BYTES) {
-    throw new Error(`Ukuran file melebihi batas ${MAX_FILE_BYTES / 1024 / 1024} MB.`);
+  if (trace) trace.sAfter = Array.from(S.slice(0, RC4_TRACE_SAMPLE));
+  // PRGA
+  const out = new Uint8Array(data.length);
+  let a = 0, b = 0;
+  for (let n = 0; n < data.length; n++) {
+    a = (a + 1) & 255;
+    b = (b + S[a]) & 255;
+    [S[a], S[b]] = [S[b], S[a]];
+    const ks = S[(S[a] + S[b]) & 255];
+    out[n] = data[n] ^ ks;
+    if (trace && n < RC4_TRACE_SAMPLE) trace.keystream.push(ks);
+    if (trace && n < RC4_TRACE_ROWS) trace.rows.push({ index: n, input: data[n], keystream: ks, output: out[n] });
   }
-
-  onProgress(10);
-
-  // Baca file sebagai ArrayBuffer
-  const fileBuffer = await file.arrayBuffer();
-  onProgress(30);
-
-  // Siapkan salt & iv
-  const salt = crypto.getRandomValues(new Uint8Array(FILE_SALT_BYTES));
-  const iv   = crypto.getRandomValues(new Uint8Array(FILE_IV_BYTES));
-  const key  = await deriveFileKey(password, salt);
-  onProgress(50);
-
-  // Encode nama file agar bisa dipulihkan saat dekripsi
-  const filenameBytes  = new TextEncoder().encode(file.name);
-  const filenameLenBuf = new Uint8Array(4);
-  new DataView(filenameLenBuf.buffer).setUint32(0, filenameBytes.length, false);
-
-  // Gabungkan: filenameLength | filename | fileContent
-  const plainCombined = new Uint8Array(
-    4 + filenameBytes.length + fileBuffer.byteLength
-  );
-  plainCombined.set(filenameLenBuf,    0);
-  plainCombined.set(filenameBytes,     4);
-  plainCombined.set(new Uint8Array(fileBuffer), 4 + filenameBytes.length);
-
-  // Enkripsi
-  const cipherBuf   = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    plainCombined
-  );
-  onProgress(80);
-
-  // Bangun payload akhir: salt | iv | ciphertext
-  const cipherBytes = new Uint8Array(cipherBuf);
-  const payload     = new Uint8Array(FILE_SALT_BYTES + FILE_IV_BYTES + cipherBytes.length);
-  payload.set(salt,        0);
-  payload.set(iv,          FILE_SALT_BYTES);
-  payload.set(cipherBytes, FILE_SALT_BYTES + FILE_IV_BYTES);
-
-  const payloadB64 = bufferToBase64(payload.buffer);
-  onProgress(95);
-
-  // Metadata yang disimpan (tanpa data plaintext)
-  const meta = {
-    id:            crypto.randomUUID(),
-    originalName:  file.name,
-    mimeType:      file.type || 'application/octet-stream',
-    size:          file.size,
-    encryptedAt:   new Date().toISOString(),
-    payloadB64:    payloadB64,
-  };
-
-  // Simpan ke localStorage
-  const stored = getStoredFiles();
-  stored.push(meta);
-  localStorage.setItem('sn_files', JSON.stringify(stored));
-
-  onProgress(100);
-  return meta;
+  return withTrace ? { out, trace } : out;
 }
 
-/**
- * Mendekripsi file dan memicu download di browser.
- *
- * @param {string} fileId    - ID file yang tersimpan
- * @param {string} password  - Kata sandi master
- * @returns {Promise<void>}
- */
-async function decryptAndDownloadFile(fileId, password) {
-  const stored = getStoredFiles();
-  const meta   = stored.find(f => f.id === fileId);
-  if (!meta) throw new Error('File tidak ditemukan.');
+const rc4 = (keyBytes, data) => rc4Core(keyBytes, data, false);
 
-  const payload    = new Uint8Array(base64ToBuffer(meta.payloadB64));
-  const salt       = payload.slice(0, FILE_SALT_BYTES);
-  const iv         = payload.slice(FILE_SALT_BYTES, FILE_SALT_BYTES + FILE_IV_BYTES);
-  const cipherData = payload.slice(FILE_SALT_BYTES + FILE_IV_BYTES);
+/** Membaca File sebagai ArrayBuffer memakai FileReader. */
+function readFileAsArrayBuffer(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result);
+    fr.onerror = () => reject(fr.error);
+    fr.readAsArrayBuffer(file);
+  });
+}
 
-  const key = await deriveFileKey(password, salt);
+/** @returns {Promise<{bytes:Uint8Array, trace:object}>} */
+async function encryptFileRC4(file, password) {
+  if (file.size > MAX_FILE_BYTES) throw new Error('Ukuran file melebihi 50 MB.');
+  const data = new Uint8Array(await readFileAsArrayBuffer(file));
+  const name = strToBytes(file.name);
+  const plain = new Uint8Array(6 + name.length + data.length);
+  plain.set(FILE_MAGIC, 0);
+  plain[4] = (name.length >> 8) & 255;
+  plain[5] = name.length & 255;
+  plain.set(name, 6);
+  plain.set(data, 6 + name.length);
+  const { out, trace } = rc4Core(strToBytes(password), plain, true);
+  trace.package = { magic: 'RC4F', nameLen: name.length, name: file.name, dataLen: data.length, totalLen: plain.length };
+  return { bytes: out, trace };
+}
 
-  let plainBuf;
-  try {
-    plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipherData);
-  } catch {
-    throw new Error('Dekripsi gagal: kata sandi salah atau file rusak.');
+/** @returns {Promise<{name:string,data:Uint8Array,trace:object}>} */
+async function decryptFileRC4(file, password) {
+  const enc = new Uint8Array(await readFileAsArrayBuffer(file));
+  const { out: plain, trace } = rc4Core(strToBytes(password), enc, true);
+  if (plain.length < 6 || FILE_MAGIC.some((m, i) => plain[i] !== m)) {
+    throw new Error('Dekripsi gagal: kunci salah atau bukan file .enc yang valid.');
   }
+  const nameLen = (plain[4] << 8) | plain[5];
+  if (6 + nameLen > plain.length) throw new Error('File rusak.');
+  const name = new TextDecoder().decode(plain.slice(6, 6 + nameLen));
+  const data = plain.slice(6 + nameLen);
+  trace.package = { magic: 'RC4F', nameLen, name, dataLen: data.length, totalLen: plain.length };
+  return { name, data, trace };
+}
 
-  // Ekstrak nama file dari payload
-  const plain          = new Uint8Array(plainBuf);
-  const filenameLen    = new DataView(plain.buffer).getUint32(0, false);
-  const filenameBytes  = plain.slice(4, 4 + filenameLen);
-  const originalName   = new TextDecoder().decode(filenameBytes);
-  const fileData       = plain.slice(4 + filenameLen);
-
-  // Buat URL sementara dan trigger download
-  const blob = new Blob([fileData], { type: meta.mimeType });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href     = url;
-  a.download = originalName;
+/** Memicu unduhan Blob. */
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
-  document.body.removeChild(a);
-  // Bebaskan memory setelah 60 detik
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
-}
-
-/**
- * Menghapus file terenkripsi dari localStorage berdasarkan ID.
- * @param {string} fileId
- */
-function deleteEncryptedFile(fileId) {
-  const stored  = getStoredFiles().filter(f => f.id !== fileId);
-  localStorage.setItem('sn_files', JSON.stringify(stored));
-}
-
-/**
- * Mengambil seluruh metadata file dari localStorage.
- * @returns {Array<Object>}
- */
-function getStoredFiles() {
-  try {
-    return JSON.parse(localStorage.getItem('sn_files') || '[]');
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Memformat ukuran file menjadi string yang mudah dibaca (KB, MB, dll).
- * @param {number} bytes
- * @returns {string}
- */
-function formatFileSize(bytes) {
-  if (bytes < 1024)           return `${bytes} B`;
-  if (bytes < 1024 * 1024)    return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
 }

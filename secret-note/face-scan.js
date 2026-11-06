@@ -1,382 +1,200 @@
 /**
  * face-scan.js — Secret Note
- * Module biometrik wajah menggunakan face-api.js (TensorFlow.js).
+ * Gatekeeper: token dongle (.key) + biometrik wajah SUNGGUHAN (face-api.js).
  *
- * Alur pendaftaran wajah:
- *   Aktifkan kamera → Deteksi wajah → Hitung face descriptor →
- *   Simpan descriptor di localStorage (tidak ada foto tersimpan)
- *
- * Alur verifikasi wajah (login):
- *   Aktifkan kamera → Deteksi wajah → Hitung descriptor →
- *   Bandingkan jarak Euclidean dengan descriptor tersimpan →
- *   Jika jarak < threshold → unlock berhasil
- *
- * Face descriptor = array 128 angka float (representasi matematis wajah).
- * Tidak ada foto/gambar wajah yang disimpan, hanya vektor matematisnya.
+ * Registrasi : webcam -> deteksi wajah -> descriptor 128-d (rata-rata beberapa frame) -> IndexedDB
+ * Verifikasi : webcam -> descriptor 128-d -> jarak Euclidean ke descriptor tersimpan
+ *              Distance = sqrt( sum_i (A_i - B_i)^2 ),  cocok jika Distance <= 0.50
+ * Tidak ada foto yang disimpan, hanya vektor 128 angka.
+ * Mode simulasi (initFaceScan) hanya fallback bila kamera/model tidak tersedia.
  */
-
 'use strict';
 
-// ── Konstanta ─────────────────────────────────────────────────────────────────
+const DONGLE_TYPE = 'SECRET-NOTE-DONGLE';
+const FACE_MATCH_THRESHOLD = 0.50;
+// Urutan: folder lokal ./models (jika ada), lalu CDN
+const FACE_MODEL_URLS = ['./models', 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/'];
+
+let faceStream = null;
+let faceRaf = null;
+let faceRunId = 0;
+let faceModelsLoaded = false;
+
+// ══ DONGLE ═══════════════════════════════════════════════════════════════════
+async function _dongleSignature(serial, secret) {
+  return hashSHA256(`${DONGLE_TYPE}|${serial}|${secret}`);
+}
+
+/** Membuat token dongle baru. @returns {{blob:Blob, serial:string}} */
+async function generateDongle() {
+  const serial = 'SN-' + bytesToHex(crypto.getRandomValues(new Uint8Array(6))).toUpperCase();
+  const secret = bytesToHex(crypto.getRandomValues(new Uint8Array(24)));
+  const token = { type: DONGLE_TYPE, version: 1, serial, secret, signature: await _dongleSignature(serial, secret) };
+  return { blob: new Blob([JSON.stringify(token, null, 2)], { type: 'application/octet-stream' }), serial };
+}
+
 /**
- * Model weights diambil langsung dari repo GitHub face-api.js.
- * npm package TIDAK menyertakan folder weights — harus dari raw.githubusercontent.
+ * Validasi file token .key dari flashdisk.
+ * @returns {Promise<{valid:boolean, reason:string, serial?:string}>}
  */
-const MODEL_URL = 'https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights';
+async function checkDongle(file) {
+  if (!file) return { valid: false, reason: 'Tidak ada file dipilih.' };
+  if (!file.name.toLowerCase().endsWith('.key')) return { valid: false, reason: 'Ekstensi harus .key' };
+  let t;
+  try { t = JSON.parse(await file.text()); } catch { return { valid: false, reason: 'Isi token tidak valid.' }; }
+  if (!t || t.type !== DONGLE_TYPE || !t.serial || !t.secret || !t.signature) return { valid: false, reason: 'Struktur token tidak dikenali.' };
+  if ((await _dongleSignature(t.serial, t.secret)) !== t.signature) return { valid: false, reason: 'Signature token tidak cocok (dimodifikasi).' };
+  const registered = await getAuth('dongle_serial');
+  if (registered && registered !== t.serial) return { valid: false, reason: 'Token bukan milik akun ini.' };
+  return { valid: true, reason: 'Token valid.', serial: t.serial };
+}
 
-/** Jarak Euclidean maksimal agar dianggap wajah yang sama (0 = identik, 1 = berbeda) */
-const FACE_MATCH_THRESHOLD = 0.45;
+// ══ KAMERA & MODEL ═══════════════════════════════════════════════════════════
+async function _startCamera(video) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error('Browser tidak mendukung kamera (gunakan localhost / HTTPS).');
+  }
+  if (faceStream) faceStream.getTracks().forEach(t => t.stop());
+  faceStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: 'user' }, audio: false });
+  video.srcObject = faceStream;
+  await video.play();
+}
 
-/** Key localStorage untuk menyimpan descriptor wajah */
-const FACE_DATA_KEY = 'sn_face_descriptor';
-
-// ── State internal ────────────────────────────────────────────────────────────
-let faceModelsLoaded  = false;    // apakah model sudah dimuat
-let faceStreamLogin   = null;     // MediaStream untuk kamera login
-let faceStreamBio     = null;     // MediaStream untuk kamera registrasi
-
-// ── Pemuat Model ──────────────────────────────────────────────────────────────
-
-/**
- * Memuat semua model face-api.js yang diperlukan dari CDN.
- * Dipanggil sekali; hasil di-cache di `faceModelsLoaded`.
- * @returns {Promise<void>}
- */
-async function loadFaceModels() {
+/** Memuat model face-api.js (tiny detector, landmark 68, recognition 128-d). */
+async function loadFaceModels(onStatus) {
   if (faceModelsLoaded) return;
-
-  // Deteksi wajah ringan (SSD Mobilenet)
-  // + Ekspresi wajah + 68 titik landmark + pengenalan identitas
-  await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
-  await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
-  await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
-
-  faceModelsLoaded = true;
-}
-
-// ── Kamera ────────────────────────────────────────────────────────────────────
-
-/**
- * Memulai stream kamera dan menghubungkannya ke elemen <video>.
- * Memanggil play() secara eksplisit agar stream langsung berjalan.
- * @param {HTMLVideoElement} videoEl
- * @returns {Promise<MediaStream>}
- */
-async function startCamera(videoEl) {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 360 } },
-    audio: false,
-  });
-  videoEl.srcObject = stream;
-
-  // Tunggu hingga metadata video siap, lalu play() secara eksplisit
-  await new Promise((resolve, reject) => {
-    videoEl.onloadedmetadata = () => {
-      videoEl.play().then(resolve).catch(reject);
-    };
-    // Fallback: jika event tidak muncul dalam 5 detik
-    setTimeout(reject, 5000, new Error('Timeout menunggu kamera.'));
-  });
-
-  return stream;
-}
-
-/**
- * Menghentikan semua track pada MediaStream (matikan kamera).
- * @param {MediaStream|null} stream
- */
-function stopCamera(stream) {
-  if (!stream) return;
-  stream.getTracks().forEach(t => t.stop());
-}
-
-// ── Deteksi & Descriptor ─────────────────────────────────────────────────────
-
-/**
- * Mendeteksi satu wajah dari video dan mengembalikan descriptor 128-dimensi.
- * @param {HTMLVideoElement} videoEl
- * @returns {Promise<Float32Array|null>} - Descriptor atau null jika tidak ada wajah
- */
-async function detectFaceDescriptor(videoEl) {
-  const detection = await faceapi
-    .detectSingleFace(videoEl, new faceapi.SsdMobilenetv1Options({ minConfidenceScore: 0.5 }))
-    .withFaceLandmarks()
-    .withFaceDescriptor();
-
-  return detection ? detection.descriptor : null;
-}
-
-/**
- * Menggambar kotak deteksi wajah ke <canvas> yang overlay di atas <video>.
- * @param {HTMLVideoElement} videoEl
- * @param {HTMLCanvasElement} canvasEl
- * @param {faceapi.FaceDetection|null} detection
- */
-function drawFaceBox(videoEl, canvasEl, detection) {
-  // Sesuaikan dimensi canvas dengan video yang ditampilkan
-  faceapi.matchDimensions(canvasEl, {
-    width:  videoEl.clientWidth,
-    height: videoEl.clientHeight,
-  });
-
-  const ctx = canvasEl.getContext('2d');
-  ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
-
-  if (!detection) return;
-
-  // Skala bounding box deteksi ke ukuran tampilan
-  const dims    = faceapi.matchDimensions(canvasEl, videoEl, true);
-  const resized = faceapi.resizeResults(detection, dims);
-
-  // Gambar kotak biru di sekitar wajah
-  ctx.strokeStyle = '#2563eb';
-  ctx.lineWidth   = 2;
-  const { x, y, width, height } = resized.detection.box;
-  ctx.strokeRect(x, y, width, height);
-}
-
-// ── Login: Scan Wajah ─────────────────────────────────────────────────────────
-
-/**
- * Memulai proses scan wajah untuk login.
- * Memuat model → aktifkan kamera → deteksi → bandingkan descriptor.
- * Panggil onSuccess() jika wajah cocok, onFailure() jika tidak.
- *
- * @param {HTMLVideoElement}  videoEl
- * @param {HTMLCanvasElement} canvasEl
- * @param {HTMLElement}       statusEl  - Element teks status
- * @param {Function}          onSuccess - Dipanggil saat wajah cocok
- * @param {Function}          onFailure - Dipanggil saat wajah tidak cocok
- * @returns {Promise<void>}
- */
-async function startFaceLogin(videoEl, canvasEl, statusEl, onSuccess, onFailure) {
-  statusEl.textContent = 'Memuat model AI…';
-
-  // Pastikan library face-api sudah ter-load
-  if (typeof faceapi === 'undefined') {
-    statusEl.textContent = 'Library AI belum siap. Muat ulang halaman.';
-    onFailure(new Error('faceapi tidak tersedia.'));
-    return;
-  }
-
-  try {
-    await loadFaceModels();
-  } catch (err) {
-    statusEl.textContent = 'Gagal memuat model. Periksa koneksi internet.';
-    onFailure(err);
-    return;
-  }
-
-  statusEl.textContent = 'Mengaktifkan kamera…';
-  try {
-    faceStreamLogin = await startCamera(videoEl);
-  } catch (err) {
-    const msg = err.name === 'NotAllowedError'
-      ? 'Izin kamera ditolak. Berikan akses kamera di browser.'
-      : `Kamera tidak tersedia: ${err.message}`;
-    statusEl.textContent = msg;
-    onFailure(err);
-    return;
-  }
-
-  // Sembunyikan panduan overlay setelah kamera aktif
-  const guide = document.getElementById('faceScanGuide');
-  if (guide) guide.style.opacity = '0';
-
-  statusEl.textContent = 'Posisikan wajah dalam bingkai…';
-
-  // Loop deteksi dengan interval tetap (bukan rAF) agar tidak berlomba dengan render
-  const startTime  = Date.now();
-  const TIMEOUT_MS = 12_000;
-  let   scanning   = true;
-
-  while (scanning) {
-    if (Date.now() - startTime > TIMEOUT_MS) {
-      stopCamera(faceStreamLogin);
-      faceStreamLogin = null;
-      if (guide) guide.style.opacity = '1';
-      statusEl.textContent = 'Waktu habis. Tekan tombol untuk coba lagi.';
-      onFailure(new Error('Timeout.'));
+  if (typeof faceapi === 'undefined') throw new Error('Library face-api.js gagal dimuat (cek koneksi internet).');
+  let lastErr;
+  for (const url of FACE_MODEL_URLS) {
+    try {
+      if (onStatus) onStatus(`Memuat model AI dari ${url} ...`);
+      await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri(url),
+        faceapi.nets.faceLandmark68Net.loadFromUri(url),
+        faceapi.nets.faceRecognitionNet.loadFromUri(url),
+      ]);
+      faceModelsLoaded = true;
       return;
-    }
+    } catch (e) { lastErr = e; }
+  }
+  throw new Error('Model AI gagal dimuat: ' + (lastErr && lastErr.message || lastErr));
+}
 
-    // Tunggu sebentar agar frame video stabil sebelum deteksi
-    await sleep(200);
+/** Jarak Euclidean antara dua vektor descriptor. */
+function euclideanDistance(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; sum += d * d; }
+  return Math.sqrt(sum);
+}
 
-    let detectionWithBox;
-    try {
-      detectionWithBox = await faceapi
-        .detectSingleFace(videoEl, new faceapi.SsdMobilenetv1Options({ minConfidenceScore: 0.5 }))
-        .withFaceLandmarks();
-    } catch {
-      // Frame tidak valid (video belum stabil) — coba lagi
-      continue;
-    }
+function _drawFaceOverlay(ctx, W, H, box, color, label) {
+  ctx.clearRect(0, 0, W, H);
+  if (!box) {
+    ctx.fillStyle = '#fbbf24'; ctx.font = '18px monospace';
+    ctx.fillText(label || 'Wajah tidak terdeteksi', 16, 30);
+    return;
+  }
+  const x = W - (box.x + box.width); // video dicerminkan lewat CSS, jadi koordinat dibalik
+  ctx.strokeStyle = color; ctx.lineWidth = 3;
+  ctx.strokeRect(x, box.y, box.width, box.height);
+  ctx.fillStyle = color; ctx.font = '16px monospace';
+  ctx.fillText(label, x, Math.max(18, box.y - 8));
+}
 
-    drawFaceBox(videoEl, canvasEl, detectionWithBox || null);
-
-    if (!detectionWithBox) {
-      statusEl.textContent = 'Wajah tidak terdeteksi…';
-      continue;
-    }
-
-    statusEl.textContent = 'Wajah terdeteksi. Memverifikasi…';
-
-    // Ambil descriptor penuh
-    let descriptor;
-    try {
-      descriptor = await detectFaceDescriptor(videoEl);
-    } catch {
-      continue;
-    }
-
-    if (!descriptor) continue;
-
-    // Bandingkan dengan descriptor tersimpan
-    const match = compareFaceDescriptor(descriptor);
-    scanning = false;
-    stopCamera(faceStreamLogin);
-    faceStreamLogin = null;
-    if (guide) guide.style.opacity = '1';
-
-    if (match) {
-      statusEl.textContent = 'Wajah dikenali!';
-      onSuccess();
+/**
+ * Mengumpulkan descriptor dari webcam dan merata-ratakannya.
+ * @returns {Promise<Float32Array>}
+ */
+async function _scanDescriptor(video, canvas, onStatus, { samples, timeoutMs, reference, verb }) {
+  const runId = ++faceRunId;
+  await loadFaceModels(onStatus);
+  if (onStatus) onStatus('Membuka kamera...');
+  await _startCamera(video);
+  const W = canvas.width = video.videoWidth || 640;
+  const H = canvas.height = video.videoHeight || 480;
+  const ctx = canvas.getContext('2d');
+  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+  const descs = [];
+  const t0 = performance.now();
+  while (descs.length < samples && performance.now() - t0 < timeoutMs) {
+    if (runId !== faceRunId) throw new Error('Pemindaian dibatalkan.');
+    const det = await faceapi.detectSingleFace(video, opts).withFaceLandmarks().withFaceDescriptor();
+    if (det) {
+      descs.push(det.descriptor);
+      let label = `${verb} ${descs.length}/${samples}`;
+      if (reference) label += `  d=${euclideanDistance(det.descriptor, reference).toFixed(3)}`;
+      _drawFaceOverlay(ctx, W, H, det.detection.box, '#22d3ee', label);
+      if (onStatus) onStatus(`${verb}... sampel ${descs.length}/${samples}`);
     } else {
-      statusEl.textContent = 'Wajah tidak dikenali.';
-      onFailure(new Error('Wajah tidak cocok.'));
+      _drawFaceOverlay(ctx, W, H, null, null, 'Wajah tidak terdeteksi — hadap kamera');
     }
   }
+  if (descs.length < samples) throw new Error('Wajah tidak terdeteksi dengan jelas. Perbaiki pencahayaan lalu coba lagi.');
+  const mean = new Float32Array(128);
+  for (const d of descs) for (let i = 0; i < 128; i++) mean[i] += d[i] / descs.length;
+  return mean;
 }
 
-/**
- * Menghentikan scanning login dan mematikan kamera.
- */
-function stopFaceLogin() {
-  stopCamera(faceStreamLogin);
-  faceStreamLogin = null;
+/** Registrasi wajah: simpan descriptor 128-d ke IndexedDB (auth_store -> face_descriptor). */
+async function registerFaceDescriptor(video, canvas, onStatus) {
+  if (await getAuth('face_descriptor')) throw new Error('Wajah sudah terdaftar. Reset DB untuk mendaftar ulang.');
+  const desc = await _scanDescriptor(video, canvas, onStatus, { samples: 5, timeoutMs: 25000, verb: 'Mendaftarkan' });
+  await setAuth('face_descriptor', Array.from(desc));
+  return desc;
 }
 
-// ── Registrasi Wajah ─────────────────────────────────────────────────────────
+/** Verifikasi wajah terhadap descriptor tersimpan. @returns {{ok, distance, similarity}} */
+async function verifyFaceBiometric(video, canvas, onStatus) {
+  const ref = await getAuth('face_descriptor');
+  if (!ref) throw new Error('Belum ada wajah terdaftar. Klik "Daftarkan Wajah" dulu.');
+  const desc = await _scanDescriptor(video, canvas, onStatus, { samples: 3, timeoutMs: 20000, reference: ref, verb: 'Memverifikasi' });
+  const distance = euclideanDistance(desc, ref);
+  const ok = distance <= FACE_MATCH_THRESHOLD;
+  const similarity = Math.max(0, Math.min(100, (1 - distance / (2 * FACE_MATCH_THRESHOLD)) * 100));
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = ok ? '#4ade80' : '#f87171';
+  ctx.font = 'bold 20px monospace';
+  ctx.fillText(`${ok ? 'MATCH' : 'DITOLAK'}  d=${distance.toFixed(3)} (batas ${FACE_MATCH_THRESHOLD})`, 16, 30);
+  return { ok, distance, similarity };
+}
 
-/**
- * Memulai kamera untuk panel registrasi wajah di tab Biometrik.
- * @param {HTMLVideoElement}  videoEl
- * @param {HTMLElement}       statusEl
- * @returns {Promise<void>}
- */
-async function startBioCameraStream(videoEl, statusEl) {
-  // Pastikan library face-api sudah ter-load
-  if (typeof faceapi === 'undefined') {
-    statusEl.textContent = 'Library AI belum siap. Muat ulang halaman.';
-    throw new Error('faceapi tidak tersedia.');
+// ══ FALLBACK SIMULASI ════════════════════════════════════════════════════════
+/** Simulasi visual (tanpa AI). Hanya untuk cadangan demo saat kamera/model bermasalah. */
+async function initFaceScan(video, canvas, onStatus) {
+  stopFaceScan();
+  let camera = true;
+  try { await _startCamera(video); } catch (e) {
+    camera = false;
+    if (onStatus) onStatus(`Kamera tidak tersedia (${e.name || 'error'}) — simulasi tanpa video.`);
   }
-
-  try {
-    statusEl.textContent = 'Memuat model AI…';
-    await loadFaceModels();
-    statusEl.textContent = 'Mengaktifkan kamera…';
-    faceStreamBio = await startCamera(videoEl);
-    statusEl.textContent = 'Kamera aktif. Posisikan wajah Anda.';
-  } catch (err) {
-    const msg = err.name === 'NotAllowedError'
-      ? 'Izin kamera ditolak. Berikan akses kamera di browser.'
-      : `Kamera gagal: ${err.message}`;
-    statusEl.textContent = msg;
-    throw err;
-  }
+  const ctx = canvas.getContext('2d');
+  canvas.width = 640;
+  canvas.height = 480;
+  const DURATION = 3000;
+  const start = performance.now();
+  return new Promise(resolve => {
+    function frame(now) {
+      const t = Math.min((now - start) / DURATION, 1);
+      ctx.clearRect(0, 0, 640, 480);
+      if (!camera) { ctx.fillStyle = '#0b1220'; ctx.fillRect(0, 0, 640, 480); }
+      const bw = 240, bh = 300, bx = 200, by = 90;
+      const color = t < 1 ? '#fbbf24' : '#4ade80';
+      ctx.strokeStyle = color; ctx.lineWidth = 3;
+      ctx.strokeRect(bx, by, bw, bh);
+      if (t < 1) { ctx.fillStyle = 'rgba(251,191,36,.6)'; ctx.fillRect(bx, by + ((now / 6) % bh), bw, 3); }
+      ctx.fillStyle = color; ctx.font = '16px monospace';
+      ctx.fillText(t < 1 ? 'SIMULASI (fallback)...' : 'SIMULASI SELESAI', bx, by - 10);
+      if (t < 1) faceRaf = requestAnimationFrame(frame);
+      else resolve({ ok: true, simulated: true });
+    }
+    faceRaf = requestAnimationFrame(frame);
+  });
 }
 
-/**
- * Menghentikan kamera registrasi.
- */
-function stopBioCameraStream() {
-  stopCamera(faceStreamBio);
-  faceStreamBio = null;
-}
-
-/**
- * Mengambil satu snapshot deskriptor wajah dari video dan menyimpannya.
- * @param {HTMLVideoElement}  videoEl
- * @param {HTMLCanvasElement} canvasEl
- * @param {HTMLElement}       statusEl
- * @returns {Promise<boolean>} - true jika berhasil terdaftar
- */
-async function captureFaceDescriptor(videoEl, canvasEl, statusEl) {
-  statusEl.textContent = 'Memindai wajah…';
-
-  // Tunggu sejenak agar frame video stabil
-  await sleep(300);
-
-  let detectionWithBox;
-  try {
-    detectionWithBox = await faceapi
-      .detectSingleFace(videoEl, new faceapi.SsdMobilenetv1Options({ minConfidenceScore: 0.5 }))
-      .withFaceLandmarks();
-  } catch (err) {
-    statusEl.textContent = 'Gagal membaca kamera. Pastikan kamera aktif.';
-    console.error('[captureFace]', err);
-    return false;
-  }
-
-  drawFaceBox(videoEl, canvasEl, detectionWithBox || null);
-
-  if (!detectionWithBox) {
-    statusEl.textContent = 'Wajah tidak terdeteksi. Pastikan pencahayaan cukup.';
-    return false;
-  }
-
-  const descriptor = await detectFaceDescriptor(videoEl);
-  if (!descriptor) {
-    statusEl.textContent = 'Gagal mengambil data wajah. Coba lagi.';
-    return false;
-  }
-
-  // Simpan descriptor sebagai array biasa (JSON serializable)
-  localStorage.setItem(FACE_DATA_KEY, JSON.stringify(Array.from(descriptor)));
-  statusEl.textContent = 'Wajah berhasil didaftarkan!';
-  return true;
-}
-
-// ── Utilitas ─────────────────────────────────────────────────
-/** Menunggu sejumlah milidetik (digunakan untuk delay antar frame). */
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ── Penyimpanan Descriptor ────────────────────────────────────────────────────
-
-/**
- * Membandingkan descriptor wajah baru dengan yang tersimpan.
- * Menggunakan jarak Euclidean (standar face-api.js).
- *
- * @param {Float32Array} descriptor  - Descriptor wajah yang baru dideteksi
- * @returns {boolean}                - true jika wajah cocok
- */
-function compareFaceDescriptor(descriptor) {
-  const raw = localStorage.getItem(FACE_DATA_KEY);
-  if (!raw) return false;
-
-  try {
-    const stored = new Float32Array(JSON.parse(raw));
-    const dist   = faceapi.euclideanDistance(descriptor, stored);
-    return dist < FACE_MATCH_THRESHOLD;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Mengecek apakah data wajah sudah terdaftar.
- * @returns {boolean}
- */
-function hasFaceData() {
-  return !!localStorage.getItem(FACE_DATA_KEY);
-}
-
-/**
- * Menghapus data wajah dari localStorage.
- */
-function removeFaceData() {
-  localStorage.removeItem(FACE_DATA_KEY);
+function stopFaceScan() {
+  faceRunId++;
+  if (faceRaf) cancelAnimationFrame(faceRaf);
+  faceRaf = null;
+  if (faceStream) faceStream.getTracks().forEach(t => t.stop());
+  faceStream = null;
 }
