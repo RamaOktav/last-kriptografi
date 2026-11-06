@@ -1,6 +1,6 @@
 /**
  * crypto.js — Secret Note
- * SHA-256, Vigenère (klasik), AES-256-GCM (modern) dan Super-Enkripsi dua lapis,
+ * SHA-256, Vigenère klasik (A-Z, mod 26), AES-256-GCM (modern) dan Super-Enkripsi dua lapis,
  * lengkap dengan "trace" langkah demi langkah untuk visualisasi presentasi.
  *   Enkripsi : Plaintext -> Vigenère -> AES-256-GCM -> Base64
  *   Dekripsi : Base64 -> AES-256-GCM -> Vigenère decrypt -> Plaintext
@@ -38,35 +38,49 @@ async function hashSHA256(data) {
   return bytesToHex(new Uint8Array(buf));
 }
 
-// ── Vigenère (ASCII printable 32..126, karakter lain dibiarkan) ──────────────
-const VIG_START = 32;
-const VIG_RANGE = 95;
+// ── Vigenère Klasik (Alfabet A-Z, modulo 26) ─────────────────────────────────
+// Sesuai teori kuliah: hanya huruf yang dienkripsi; A=0 ... Z=25.
+//   Enkripsi: C = (P + K) mod 26
+//   Dekripsi: P = (C − K + 26) mod 26
+// Huruf kecil tetap kecil, huruf besar tetap besar. Angka, spasi, dan simbol
+// dilewatkan apa adanya (pass-through) dan TIDAK memajukan indeks kunci.
+
+/** Membersihkan kunci: hanya huruf A-Z (huruf besar). */
+function normalizeVigenereKey(key) {
+  const k = String(key || '').toUpperCase().replace(/[^A-Z]/g, '');
+  if (!k) throw new Error('Kunci Vigenère harus mengandung minimal 1 huruf A-Z.');
+  return k;
+}
 
 /**
- * @returns {{text:string, steps:Array}} steps: tiap karakter beserta detail pergeseran
+ * @returns {{text:string, key:string, steps:Array}}
+ *   steps: [{ char, code, isAlpha, keyChar, keyShift, p, c, resChar, resCode }]
  */
 function _vigenereCore(text, key, dir) {
-  if (!key) throw new Error('Kunci Vigenère tidak boleh kosong.');
-  const keyChars = Array.from(key);
-  const shifts = keyChars.map(c => c.charCodeAt(0) % VIG_RANGE);
+  const k = normalizeVigenereKey(key);
   let ki = 0;
   let out = '';
   const steps = [];
   for (const ch of text) {
     const code = ch.codePointAt(0);
-    if (code >= VIG_START && code < VIG_START + VIG_RANGE) {
-      const idx = ki++ % shifts.length;
-      const shift = shifts[idx] * dir;
-      const n = (((code - VIG_START + shift) % VIG_RANGE) + VIG_RANGE) % VIG_RANGE;
-      const res = String.fromCharCode(n + VIG_START);
+    const isUpper = code >= 65 && code <= 90;
+    const isLower = code >= 97 && code <= 122;
+    if (isUpper || isLower) {
+      const base = isUpper ? 65 : 97;
+      const keyChar = k[ki % k.length];
+      const shift = keyChar.charCodeAt(0) - 65;
+      ki++;
+      const p = code - base;
+      const r = dir > 0 ? (p + shift) % 26 : (p - shift + 26) % 26;
+      const res = String.fromCharCode(r + base);
       out += res;
-      steps.push({ char: ch, code, keyChar: keyChars[idx], keyShift: shifts[idx], resChar: res, resCode: n + VIG_START, skipped: false });
+      steps.push({ char: ch, code, isAlpha: true, keyChar, keyShift: shift, p, c: r, resChar: res, resCode: r + base });
     } else {
       out += ch;
-      steps.push({ char: ch, code, keyChar: '', keyShift: 0, resChar: ch, resCode: code, skipped: true });
+      steps.push({ char: ch, code, isAlpha: false, keyChar: '', keyShift: 0, p: null, c: null, resChar: ch, resCode: code });
     }
   }
-  return { text: out, steps };
+  return { text: out, key: k, steps };
 }
 
 const vigenereEncryptTrace = (p, k) => _vigenereCore(p, k, 1);
@@ -143,14 +157,14 @@ const aesDecrypt = async (ciphertextB64, key) => (await aesDecryptTrace(cipherte
 async function superEncryptTrace(plaintext, vigenereKey, aesKey) {
   const vig = vigenereEncryptTrace(plaintext, vigenereKey);
   const aes = await aesEncryptTrace(vig.text, aesKey);
-  return { plaintext, vigText: vig.text, vigSteps: vig.steps, aes };
+  return { plaintext, vigKey: vig.key, vigText: vig.text, vigSteps: vig.steps, aes };
 }
 
 /** @returns {{aes, vigCipher, vigSteps, plain}} */
 async function superDecryptTrace(ciphertext, vigenereKey, aesKey) {
   const aes = await aesDecryptTrace(ciphertext, aesKey);
   const vig = vigenereDecryptTrace(aes.plain, vigenereKey);
-  return { aes, vigCipher: aes.plain, vigSteps: vig.steps, plain: vig.text };
+  return { aes, vigKey: vig.key, vigCipher: aes.plain, vigSteps: vig.steps, plain: vig.text };
 }
 
 async function superEncrypt(text, vigenereKey, aesKey) {

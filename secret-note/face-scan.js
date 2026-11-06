@@ -1,16 +1,17 @@
 /**
  * face-scan.js — Secret Note
- * Gatekeeper: token dongle (.key) + biometrik wajah SUNGGUHAN (face-api.js).
- *
- * Registrasi : webcam -> deteksi wajah -> descriptor 128-d (rata-rata beberapa frame) -> IndexedDB
- * Verifikasi : webcam -> descriptor 128-d -> jarak Euclidean ke descriptor tersimpan
- *              Distance = sqrt( sum_i (A_i - B_i)^2 ),  cocok jika Distance <= 0.50
- * Tidak ada foto yang disimpan, hanya vektor 128 angka.
- * Mode simulasi (initFaceScan) hanya fallback bila kamera/model tidak tersedia.
+ * Gatekeeper multi-user:
+ *   (1) Dual-Mode USB Dongle — 1 USB = 1 User
+ *       • Mode USB fisik : File System Access API (showDirectoryPicker) + watcher auto-lock saat dicabut
+ *       • Mode upload    : <input type=file> manual (fallback)
+ *   (2) Biometrik wajah SUNGGUHAN (face-api.js) — descriptor 128-d + jarak Euclidean
+ *       Distance = sqrt( sum_i (A_i - B_i)^2 ),  cocok jika Distance <= 0.50
+ *       Mode simulasi (initFaceScan) hanya fallback bila kamera/model tidak tersedia.
  */
 'use strict';
 
 const DONGLE_TYPE = 'SECRET-NOTE-DONGLE';
+const USB_WATCH_INTERVAL = 2000;
 const FACE_MATCH_THRESHOLD = 0.50;
 // Urutan: folder lokal ./models (jika ada), lalu CDN
 const FACE_MODEL_URLS = ['./models', 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/'];
@@ -19,34 +20,123 @@ let faceStream = null;
 let faceRaf = null;
 let faceRunId = 0;
 let faceModelsLoaded = false;
+let usbWatchTimer = null;
 
-// ══ DONGLE ═══════════════════════════════════════════════════════════════════
-async function _dongleSignature(serial, secret) {
-  return hashSHA256(`${DONGLE_TYPE}|${serial}|${secret}`);
+// ══ DONGLE TOKEN ═════════════════════════════════════════════════════════════
+const dongleFileName = (username) => `dongle-${username}.key`;
+const isUsbApiSupported = () => typeof window.showDirectoryPicker === 'function';
+
+async function _dongleSignature(serial, username, secret) {
+  return hashSHA256(`${DONGLE_TYPE}|${serial}|${username}|${secret}`);
 }
 
-/** Membuat token dongle baru. @returns {{blob:Blob, serial:string}} */
-async function generateDongle() {
+/** Membuat token dongle untuk satu user. @returns {{blob, serial, fileName, json}} */
+async function generateDongle(username) {
   const serial = 'SN-' + bytesToHex(crypto.getRandomValues(new Uint8Array(6))).toUpperCase();
   const secret = bytesToHex(crypto.getRandomValues(new Uint8Array(24)));
-  const token = { type: DONGLE_TYPE, version: 1, serial, secret, signature: await _dongleSignature(serial, secret) };
-  return { blob: new Blob([JSON.stringify(token, null, 2)], { type: 'application/octet-stream' }), serial };
+  const token = { type: DONGLE_TYPE, version: 2, serial, username, secret, signature: await _dongleSignature(serial, username, secret) };
+  const json = JSON.stringify(token, null, 2);
+  return { blob: new Blob([json], { type: 'application/octet-stream' }), serial, fileName: dongleFileName(username), json };
 }
 
 /**
- * Validasi file token .key dari flashdisk.
+ * Validasi isi token terhadap user yang dipilih.
  * @returns {Promise<{valid:boolean, reason:string, serial?:string}>}
  */
-async function checkDongle(file) {
+async function verifyDonglePayload(jsonStr, targetUsername) {
+  let t;
+  try { t = JSON.parse(jsonStr); } catch { return { valid: false, reason: 'Isi token bukan JSON yang valid.' }; }
+  if (!t || t.type !== DONGLE_TYPE || !t.serial || !t.username || !t.secret || !t.signature) {
+    return { valid: false, reason: 'Struktur token tidak dikenali.' };
+  }
+  if ((await _dongleSignature(t.serial, t.username, t.secret)) !== t.signature) {
+    return { valid: false, reason: 'Signature SHA-256 tidak cocok — token telah dimodifikasi (tampered).' };
+  }
+  if (t.username !== targetUsername) {
+    return { valid: false, reason: `Token ini milik user "${t.username}", bukan "${targetUsername}".` };
+  }
+  const user = await getUser(targetUsername);
+  if (!user) return { valid: false, reason: 'User tidak ditemukan di database.' };
+  if (user.dongleSerial !== t.serial) return { valid: false, reason: 'Serial token tidak terdaftar untuk user ini (token lama/dicabut).' };
+  return { valid: true, reason: 'Token valid.', serial: t.serial };
+}
+
+/** Mode upload manual. */
+async function checkDongleFile(file, targetUsername) {
   if (!file) return { valid: false, reason: 'Tidak ada file dipilih.' };
   if (!file.name.toLowerCase().endsWith('.key')) return { valid: false, reason: 'Ekstensi harus .key' };
-  let t;
-  try { t = JSON.parse(await file.text()); } catch { return { valid: false, reason: 'Isi token tidak valid.' }; }
-  if (!t || t.type !== DONGLE_TYPE || !t.serial || !t.secret || !t.signature) return { valid: false, reason: 'Struktur token tidak dikenali.' };
-  if ((await _dongleSignature(t.serial, t.secret)) !== t.signature) return { valid: false, reason: 'Signature token tidak cocok (dimodifikasi).' };
-  const registered = await getAuth('dongle_serial');
-  if (registered && registered !== t.serial) return { valid: false, reason: 'Token bukan milik akun ini.' };
-  return { valid: true, reason: 'Token valid.', serial: t.serial };
+  return verifyDonglePayload(await file.text(), targetUsername);
+}
+
+/** Mencari file token di folder (root dan subfolder SECRETNOTE). */
+async function _findDongleHandle(dirHandle, username) {
+  const name = dongleFileName(username);
+  try { return await dirHandle.getFileHandle(name); } catch { /* lanjut */ }
+  try {
+    const sub = await dirHandle.getDirectoryHandle('SECRETNOTE');
+    return await sub.getFileHandle(name);
+  } catch { return null; }
+}
+
+/** Meminta akses folder/drive USB (butuh gesture user). */
+async function pickUsbDrive(mode = 'read') {
+  if (!isUsbApiSupported()) throw new Error('Browser tidak mendukung File System Access API (gunakan Chrome/Edge via localhost).');
+  try {
+    return await window.showDirectoryPicker({ id: 'secretnote-usb', mode });
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Pemilihan drive dibatalkan.');
+    throw new Error('Drive tidak dapat dibuka: ' + e.message + ' — jika root drive diblokir, simpan token di folder E:\\SECRETNOTE lalu pilih folder itu.');
+  }
+}
+
+/**
+ * Mode USB fisik: pilih drive lalu baca dongle-<username>.key.
+ * @returns {Promise<{valid, reason, serial?, dirHandle?, fileHandle?, content?}>}
+ */
+async function connectUsbDrive(targetUsername) {
+  const dirHandle = await pickUsbDrive('read');
+  const fileHandle = await _findDongleHandle(dirHandle, targetUsername);
+  if (!fileHandle) {
+    return { valid: false, reason: `File ${dongleFileName(targetUsername)} tidak ditemukan di drive "${dirHandle.name}".` };
+  }
+  const content = await (await fileHandle.getFile()).text();
+  const r = await verifyDonglePayload(content, targetUsername);
+  return { ...r, dirHandle, fileHandle, content, driveName: dirHandle.name };
+}
+
+/** Menulis token langsung ke flashdisk (registrasi). */
+async function writeDongleToUsb(dongle) {
+  const dirHandle = await pickUsbDrive('readwrite');
+  const fh = await dirHandle.getFileHandle(dongle.fileName, { create: true });
+  const w = await fh.createWritable();
+  await w.write(dongle.json);
+  await w.close();
+  return dirHandle.name;
+}
+
+/**
+ * Watcher: tiap 2 detik membaca ulang token dari drive.
+ * Jika drive dicabut / file hilang / isi berubah → onEject(reason).
+ */
+function startUsbWatcher(fileHandle, expectedContent, onEject) {
+  stopUsbWatcher();
+  let busy = false;
+  usbWatchTimer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const text = await (await fileHandle.getFile()).text();
+      if (text !== expectedContent) { stopUsbWatcher(); onEject('Isi token pada USB berubah.'); }
+    } catch (e) {
+      stopUsbWatcher();
+      onEject('USB dongle dicabut / tidak dapat dibaca (' + (e.name || 'error') + ').');
+    } finally { busy = false; }
+  }, USB_WATCH_INTERVAL);
+}
+
+function stopUsbWatcher() {
+  if (usbWatchTimer) clearInterval(usbWatchTimer);
+  usbWatchTimer = null;
 }
 
 // ══ KAMERA & MODEL ═══════════════════════════════════════════════════════════
@@ -105,7 +195,7 @@ function _drawFaceOverlay(ctx, W, H, box, color, label) {
  * Mengumpulkan descriptor dari webcam dan merata-ratakannya.
  * @returns {Promise<Float32Array>}
  */
-async function _scanDescriptor(video, canvas, onStatus, { samples, timeoutMs, reference, verb }) {
+async function scanFaceDescriptor(video, canvas, onStatus, { samples = 5, timeoutMs = 25000, reference = null, verb = 'Memindai' } = {}) {
   const runId = ++faceRunId;
   await loadFaceModels(onStatus);
   if (onStatus) onStatus('Membuka kamera...');
@@ -135,20 +225,11 @@ async function _scanDescriptor(video, canvas, onStatus, { samples, timeoutMs, re
   return mean;
 }
 
-/** Registrasi wajah: simpan descriptor 128-d ke IndexedDB (auth_store -> face_descriptor). */
-async function registerFaceDescriptor(video, canvas, onStatus) {
-  if (await getAuth('face_descriptor')) throw new Error('Wajah sudah terdaftar. Reset DB untuk mendaftar ulang.');
-  const desc = await _scanDescriptor(video, canvas, onStatus, { samples: 5, timeoutMs: 25000, verb: 'Mendaftarkan' });
-  await setAuth('face_descriptor', Array.from(desc));
-  return desc;
-}
-
-/** Verifikasi wajah terhadap descriptor tersimpan. @returns {{ok, distance, similarity}} */
-async function verifyFaceBiometric(video, canvas, onStatus) {
-  const ref = await getAuth('face_descriptor');
-  if (!ref) throw new Error('Belum ada wajah terdaftar. Klik "Daftarkan Wajah" dulu.');
-  const desc = await _scanDescriptor(video, canvas, onStatus, { samples: 3, timeoutMs: 20000, reference: ref, verb: 'Memverifikasi' });
-  const distance = euclideanDistance(desc, ref);
+/** Verifikasi wajah terhadap descriptor milik user. @returns {{ok, distance, similarity}} */
+async function verifyUserFace(video, canvas, storedDescriptor, onStatus) {
+  if (!storedDescriptor) throw new Error('User ini tidak memiliki data wajah (didaftarkan via simulasi). Aktifkan mode simulasi.');
+  const desc = await scanFaceDescriptor(video, canvas, onStatus, { samples: 3, timeoutMs: 20000, reference: storedDescriptor, verb: 'Memverifikasi' });
+  const distance = euclideanDistance(desc, storedDescriptor);
   const ok = distance <= FACE_MATCH_THRESHOLD;
   const similarity = Math.max(0, Math.min(100, (1 - distance / (2 * FACE_MATCH_THRESHOLD)) * 100));
   const ctx = canvas.getContext('2d');

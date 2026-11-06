@@ -17,6 +17,7 @@
       <button class="tab locked" data-tab="ledger">5 · Ledger &amp; DB</button>
     </nav>
     <div class="session">
+      <span id="userBadge" class="badge user hidden">👤 —</span>
       <span id="sessionBadge" class="badge bad">TERKUNCI</span>
       <button id="btnLogout" class="btn small hidden">Logout</button>
     </div>
@@ -25,23 +26,37 @@
   <main>
     <!-- TAB 1 -->
     <section id="tab-login" class="panel active">
-      <h2>Gatekeeper — Autentikasi 3 Faktor</h2>
+      <h2>Gatekeeper — Autentikasi 3 Faktor (Multi-User)</h2>
 
-      <div id="setupCard" class="card hidden">
-        <h3>🆕 Registrasi Pertama</h3>
-        <p class="muted">Belum ada akun. Buat Master PIN; token dongle <code>.key</code> akan diunduh — simpan di flashdisk.</p>
+      <div id="lockAlert" class="alert hidden"></div>
+
+      <div class="card">
         <div class="row">
-          <input type="password" id="setupPin" placeholder="Master PIN (min. 4 karakter)" />
-          <button id="btnSetup" class="btn primary">Daftarkan &amp; Buat Dongle</button>
+          <div class="col">
+            <label>Pilih Akun</label>
+            <select id="userSelect"><option value="">— memuat —</option></select>
+          </div>
+          <button id="btnOpenRegister" class="btn">➕ Daftar User Baru</button>
         </div>
+        <div id="userInfo" class="muted"></div>
       </div>
 
       <div class="grid3">
         <div class="card">
-          <h3>① Dongle Token</h3>
-          <p class="muted">Upload file <code>.key</code> dari USB/Flashdisk.</p>
-          <input type="file" id="dongleFile" accept=".key" />
-          <div id="dongleStatus" class="status">Belum diverifikasi</div>
+          <h3>① USB Dongle <span class="muted">(1 USB = 1 User)</span></h3>
+          <div class="seg">
+            <label><input type="radio" name="dongleMode" value="usb" checked /> Deteksi USB Flashdrive</label>
+            <label><input type="radio" name="dongleMode" value="upload" /> Upload .key Manual</label>
+          </div>
+          <div id="dongleUsbBox">
+            <p class="muted">Colok flashdisk, lalu pilih drive (atau folder <code>SECRETNOTE</code>) yang berisi <code id="dongleNameHint">dongle-&lt;user&gt;.key</code>. Mencabut USB saat sesi aktif akan <b>mengunci aplikasi otomatis</b>.</p>
+            <button id="btnUsbConnect" class="btn primary">🔌 Hubungkan USB Flashdrive</button>
+          </div>
+          <div id="dongleUploadBox" class="hidden">
+            <p class="muted">Pilih file <code>.key</code> milik akun ini. (Tanpa auto-lock.)</p>
+            <input type="file" id="dongleFile" accept=".key" />
+          </div>
+          <div id="dongleStatus" class="status">Pilih akun terlebih dahulu</div>
         </div>
 
         <div class="card">
@@ -50,12 +65,9 @@
             <video id="faceVideo" autoplay muted playsinline></video>
             <canvas id="faceCanvas"></canvas>
           </div>
-          <div class="row">
-            <button id="btnFaceReg" class="btn">Daftarkan Wajah</button>
-            <button id="btnFace" class="btn primary">Verifikasi Wajah</button>
-          </div>
+          <button id="btnFace" class="btn primary">Verifikasi Wajah</button>
           <label class="check"><input type="checkbox" id="faceSim" /> Mode simulasi (fallback darurat, tanpa AI)</label>
-          <div id="faceStatus" class="status">Memeriksa data wajah...</div>
+          <div id="faceStatus" class="status">Pilih akun terlebih dahulu</div>
           <div id="faceDist" class="muted"></div>
         </div>
 
@@ -71,12 +83,12 @@
     <!-- TAB 2 -->
     <section id="tab-text" class="panel">
       <h2>Super-Encryption Teks</h2>
-      <p class="muted">Plaintext → Vigenère (klasik) → AES-256-GCM (modern) → Ciphertext</p>
+      <p class="muted">Plaintext → Vigenère klasik (A–Z, mod 26) → AES-256-GCM (modern) → Ciphertext</p>
       <div class="card">
         <label>Teks (Plaintext / Ciphertext Base64)</label>
         <textarea id="textInput" rows="5" placeholder="Tulis pesan rahasia atau tempel ciphertext..."></textarea>
         <div class="row">
-          <div class="col"><label>Kunci Vigenère</label><input type="text" id="vigKey" placeholder="mis. KRIPTO" /></div>
+          <div class="col"><label>Kunci Vigenère (huruf A–Z)</label><input type="text" id="vigKey" placeholder="mis. KRIPTO" /></div>
           <div class="col"><label>Kunci AES</label><input type="password" id="aesKey" placeholder="Passphrase AES" /></div>
         </div>
         <div class="row">
@@ -94,7 +106,7 @@
         <div id="textSteps" class="steps"><span class="muted">Jalankan enkripsi/dekripsi untuk melihat langkah-langkahnya.</span></div>
       </div>
       <div class="card">
-        <h3>Vault Teks</h3>
+        <h3>Vault Teks Pribadi</h3>
         <div id="vaultTextList" class="list"></div>
       </div>
     </section>
@@ -121,7 +133,7 @@
         <div id="fileSteps" class="steps"><span class="muted">Jalankan enkripsi/dekripsi file untuk melihat KSA, PRGA, dan XOR.</span></div>
       </div>
       <div class="card">
-        <h3>Vault File (.enc)</h3>
+        <h3>Vault File Pribadi (.enc)</h3>
         <div id="vaultFileList" class="list"></div>
       </div>
     </section>
@@ -183,6 +195,42 @@
   </main>
 
   <div id="toast" class="toast"></div>
+
+  <!-- MODAL REGISTRASI USER -->
+  <div id="regModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="row space">
+        <h3>➕ Daftar User Baru</h3>
+        <button id="btnRegClose" class="btn small">✕</button>
+      </div>
+      <div class="reg-grid">
+        <div class="col">
+          <label>1. Username (huruf kecil, angka, _ atau -, 3–20)</label>
+          <input type="text" id="regUser" placeholder="mis. rama" maxlength="20" />
+          <label>2. Master PIN (min. 4 karakter)</label>
+          <input type="password" id="regPin" placeholder="PIN" />
+          <input type="password" id="regPin2" placeholder="Ulangi PIN" />
+          <label>4. Simpan Dongle</label>
+          <div class="seg">
+            <label><input type="radio" name="regDongle" value="usb" checked /> Tulis langsung ke USB</label>
+            <label><input type="radio" name="regDongle" value="download" /> Download .key</label>
+          </div>
+        </div>
+        <div class="col">
+          <label>3. Rekam Wajah (128-d descriptor)</label>
+          <div class="camera">
+            <video id="regVideo" autoplay muted playsinline></video>
+            <canvas id="regCanvas"></canvas>
+          </div>
+          <button id="btnRegFace" class="btn">📷 Rekam Wajah</button>
+          <label class="check"><input type="checkbox" id="regFaceSkip" /> Lewati wajah (akun hanya bisa login via mode simulasi)</label>
+          <div id="regFaceStatus" class="status">Belum direkam</div>
+        </div>
+      </div>
+      <button id="btnRegSubmit" class="btn primary">Daftarkan User &amp; Buat Dongle</button>
+      <div id="regStatus" class="status hidden"></div>
+    </div>
+  </div>
 
   <script src="db.js"></script>
   <script src="crypto.js"></script>

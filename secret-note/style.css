@@ -16,6 +16,14 @@ code{background:#0a1222;padding:1px 6px;border-radius:4px;color:var(--cyan);font
 .badge{padding:4px 10px;border-radius:999px;font-size:.75rem;font-weight:700;border:1px solid}
 .badge.ok{color:var(--green);border-color:var(--green)}
 .badge.bad{color:var(--red);border-color:var(--red)}
+.badge.user{color:var(--cyan);border-color:var(--cyan);background:rgba(34,211,238,.08)}
+.alert{padding:12px 16px;border-radius:10px;border:1px solid var(--red);background:rgba(248,113,113,.12);color:var(--red);font-weight:600;margin:10px 0}
+.seg{display:flex;gap:12px;flex-wrap:wrap;background:#0a1222;padding:8px 12px;border-radius:8px;border:1px solid var(--line)}
+.seg label{display:flex;gap:6px;align-items:center;color:var(--txt);cursor:pointer;font-size:.82rem}
+.row.space{justify-content:space-between;align-items:center}
+.modal{position:fixed;inset:0;background:rgba(4,8,16,.82);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;padding:16px;z-index:40}
+.modal-box{background:var(--card);border:1px solid var(--cyan);border-radius:14px;padding:20px;width:100%;max-width:760px;max-height:92vh;overflow:auto;display:flex;flex-direction:column;gap:12px}
+.reg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
 main{max-width:1150px;margin:0 auto;padding:24px}
 .panel{display:none}.panel.active{display:block}
 h2{margin:0 0 6px;color:var(--cyan)}h3{margin:0 0 8px}
