@@ -1,952 +1,694 @@
 /**
  * app.js — Secret Note
- * Orkestrasi utama aplikasi: state, UI, routing, dan event binding.
- *
- * Tanggung jawab:
- *   - Manajemen state aplikasi (terkunci / terbuka)
- *   - Routing antar tab & modal
- *   - Binding fitur enkripsi catatan (crypto.js)
- *   - Binding fitur enkripsi file (file-crypto.js)
- *   - Binding fitur biometrik (face-scan.js)
- *   - Toast & notifikasi
+ * Multi-User Orchestration, Dual-Mode USB Dongle (with Auto-Lock on Eject),
+ * Real Face Biometrics, Vigenère Klasik A-Z Mod 26 Tracer, & Blockchain Ledger.
  */
-
 'use strict';
 
-// ══════════════════════════════════════════════════════════════
-// SECTION 1 — STATE GLOBAL
-// ══════════════════════════════════════════════════════════════
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-/** Kata sandi sesi aktif (di memori, tidak disimpan). */
-let sessionPassword = null;
+// ══ STATE SESSI & MULTI-USER ═════════════════════════════════════════════════
+let currentActiveUser = null;
+let loggedIn = false;
 
-/** ID catatan yang sedang diedit (null = catatan baru). */
-let currentEditNoteId = null;
-
-// ── Keys localStorage ─────────────────────────────────────────
-const LS_NOTES   = 'sn_notes';
-const LS_PWHASH  = 'sn_password_hash';
-
-// ══════════════════════════════════════════════════════════════
-// SECTION 2 — INIT
-// ══════════════════════════════════════════════════════════════
-
-document.addEventListener('DOMContentLoaded', () => {
-  // Cek apakah kata sandi sudah pernah diatur
-  const hasPassword = !!localStorage.getItem(LS_PWHASH);
-
-  if (!hasPassword) {
-    // Pengguna baru — arahkan langsung ke setup
-    openSetupModal();
+// ══ BLOCKCHAIN ═══════════════════════════════════════════════════════════════
+class Block {
+  constructor(index, timestamp, username, data, previousHash = '') {
+    this.index = index;
+    this.timestamp = timestamp;
+    this.username = username || 'SYSTEM';
+    this.data = data;
+    this.previousHash = previousHash;
+    this.hash = '';
   }
-
-  // Update status biometrik di tab bio
-  updateBioStatus();
-});
-
-// ══════════════════════════════════════════════════════════════
-// SECTION 3 — LOCK / UNLOCK
-// ══════════════════════════════════════════════════════════════
-
-/**
- * Membuka kunci aplikasi setelah password diverifikasi.
- * Tampilkan main content dan sembunyikan layar lock.
- * @param {string} password - Kata sandi yang sudah diverifikasi
- */
-function unlockApp(password) {
-  sessionPassword = password;
-  document.getElementById('lockScreen').style.display = 'none';
-  showElement('navbar');
-  showElement('mainContent');
-  renderNoteList();
-  renderFileList();
-  updateBioStatus();
+  async calculateHash() {
+    return hashSHA256(this.index + '|' + this.timestamp + '|' + this.username + '|' + JSON.stringify(this.data) + '|' + this.previousHash);
+  }
+  static async create(index, timestamp, username, data, previousHash = '') {
+    const b = new Block(index, timestamp, username, data, previousHash);
+    b.hash = await b.calculateHash();
+    return b;
+  }
+  static async fromRecord(r) {
+    const b = new Block(r.index, r.timestamp, r.username || 'SYSTEM', r.data, r.previousHash);
+    b.hash = r.hash;
+    return b;
+  }
 }
 
-/**
- * Mengunci aplikasi kembali: hapus session, tampilkan lock screen.
- */
-function lockApp() {
-  sessionPassword = null;
-
-  // Hentikan kamera jika aktif
-  stopFaceLogin();
-  stopBioCameraStream();
-
-  hideElement('navbar');
-  hideElement('mainContent');
-  document.getElementById('lockScreen').style.display = 'flex';
-
-  // Reset form login
-  document.getElementById('masterPassword').value = '';
-  hideElement('passwordWarning');
-
-  showToast('Aplikasi dikunci.', 'info');
+class Blockchain {
+  constructor() { this.chain = []; }
+  async createGenesisBlock() {
+    return Block.create(0, new Date().toISOString(), 'SYSTEM', { action: 'GENESIS', detail: 'Secret Note Multi-User Ledger' }, '0');
+  }
+  getLatestBlock() { return this.chain[this.chain.length - 1]; }
+  async addBlock(newBlock) {
+    newBlock.previousHash = this.getLatestBlock().hash;
+    newBlock.hash = await newBlock.calculateHash();
+    this.chain.push(newBlock);
+    await addBlockToDB(newBlock);
+    return newBlock;
+  }
+  async isChainValid() {
+    for (let i = 0; i < this.chain.length; i++) {
+      const cur = this.chain[i];
+      if (cur.hash !== await cur.calculateHash()) return { valid: false, at: i };
+      if (i > 0 && cur.previousHash !== this.chain[i - 1].hash) return { valid: false, at: i };
+    }
+    return { valid: true };
+  }
+  async load() {
+    const recs = await getAllBlocksFromDB();
+    this.chain = [];
+    for (const r of recs) this.chain.push(await Block.fromRecord(r));
+    if (!this.chain.length) {
+      const g = await this.createGenesisBlock();
+      this.chain.push(g);
+      await addBlockToDB(g);
+    }
+  }
 }
 
-// ── Login: Kata Sandi ─────────────────────────────────────────
+const ledger = new Blockchain();
 
-/**
- * Mencoba unlock dengan kata sandi yang dimasukkan pengguna.
- */
-async function unlockWithPassword() {
-  const pwInput = document.getElementById('masterPassword');
-  const pw      = pwInput.value.trim();
+/** Catat aksi sukses ke blockchain dengan identitas pelaku. */
+async function logAction(action, detail, actor = null) {
+  const user = actor || currentActiveUser || $('userSelect')?.value || 'SYSTEM';
+  await ledger.addBlock(new Block(ledger.chain.length, new Date().toISOString(), user, { action, detail }));
+  renderChain();
+}
 
-  if (!pw) return;
+// ══ UTIL UI ══════════════════════════════════════════════════════════════════
+let toastTimer;
+function toast(msg, isErr = false) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isErr ? ' err' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3400);
+}
+function setStatus(id, msg, kind = '') { const e = $(id); if (!e) return; e.textContent = msg; e.className = 'status ' + kind; }
+const fmtBytes = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(2) + ' MB';
+async function guard(btn, fn) {
+  btn.disabled = true;
+  try { await fn(); } catch (e) { toast(e.message || String(e), true); console.error(e); } finally { btn.disabled = false; }
+}
 
-  const storedHash = localStorage.getItem(LS_PWHASH);
-  if (!storedHash) {
-    openSetupModal();
+// ══ TAB NAV & SESSION ════════════════════════════════════════════════════════
+function showTab(name) {
+  if (!loggedIn && name !== 'login') { toast('Login terlebih dahulu di Gatekeeper.', true); return; }
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
+  if (name === 'ledger') { renderChain(); renderDb(); }
+  if (name === 'text') renderVaultText();
+  if (name === 'file') renderVaultFiles();
+  if (name !== 'login') stopFaceScan();
+}
+
+function setSession(state, username = null) {
+  loggedIn = state;
+  currentActiveUser = state ? username : null;
+  $('sessionBadge').textContent = state ? '🟢 TERBUKA' : 'TERKUNCI';
+  $('sessionBadge').className = 'badge ' + (state ? 'ok' : 'bad');
+  $('userBadge').textContent = state ? `👤 User: ${username}` : '👤 —';
+  $('userBadge').classList.toggle('hidden', !state);
+  $('btnLogout').classList.toggle('hidden', !state);
+  document.querySelectorAll('.tab').forEach(t => { if (t.dataset.tab !== 'login') t.classList.toggle('locked', !state); });
+}
+
+// ══ TAB 1: GATEKEEPER & MULTI-USER AUTH ══════════════════════════════════════
+let selectedUser = null;
+let dongleOk = false, faceOk = false, faceMode = 'asli', dongleModeUsed = 'usb';
+let activeUsbHandle = null, activeUsbContent = null;
+let regFaceDesc = null;
+
+function getDongleMode() {
+  const checked = document.querySelector('input[name="dongleMode"]:checked');
+  return checked ? checked.value : 'usb';
+}
+
+function updateLoginHint() {
+  if (!selectedUser) {
+    setStatus('loginStatus', 'Pilih atau daftarkan akun terlebih dahulu');
     return;
   }
+  if (dongleOk && faceOk) setStatus('loginStatus', `Faktor ① & ② lolos untuk "${selectedUser.username}". Masukkan PIN.`, 'ok');
+  else setStatus('loginStatus', 'Selesaikan faktor ① (Dongle) dan ② (Wajah) lebih dulu');
+}
 
-  const isValid = await verifyPassword(pw, storedHash);
-
-  if (isValid) {
-    hideElement('passwordWarning');
-    unlockApp(pw);
+function resetFactorStates() {
+  stopUsbWatcher();
+  stopFaceScan();
+  dongleOk = false;
+  faceOk = false;
+  activeUsbHandle = null;
+  activeUsbContent = null;
+  $('dongleFile').value = '';
+  $('faceDist').textContent = '';
+  if (!selectedUser) {
+    $('userInfo').textContent = 'Belum ada akun dipilih. Klik "Daftar User Baru" untuk membuat akun.';
+    $('dongleNameHint').textContent = 'dongle-<user>.key';
+    setStatus('dongleStatus', 'Pilih akun terlebih dahulu');
+    setStatus('faceStatus', 'Pilih akun terlebih dahulu');
   } else {
-    showElement('passwordWarning');
-    pwInput.value = '';
-    pwInput.focus();
+    const hasFace = Array.isArray(selectedUser.faceDescriptor) && selectedUser.faceDescriptor.length === 128;
+    $('userInfo').textContent = `Serial Dongle terdaftar: ${selectedUser.dongleSerial} · Biometrik Wajah: ${hasFace ? '128-d Vector Tersimpan' : 'Tidak ada (gunakan mode simulasi)'}`;
+    $('dongleNameHint').textContent = dongleFileName(selectedUser.username);
+    setStatus('dongleStatus', `Menunggu verifikasi ${dongleFileName(selectedUser.username)}`);
+    setStatus('faceStatus', hasFace ? `Siap memverifikasi wajah "${selectedUser.username}".` : 'User ini didaftarkan tanpa wajah — centang Mode Simulasi.');
   }
+  updateLoginHint();
 }
 
-// ── Login: Face Scan ──────────────────────────────────────────
-
-/**
- * Memulai proses login dengan face scan.
- */
-async function startFaceScan() {
-  // Cek apakah data wajah tersedia
-  if (!hasFaceData()) {
-    document.getElementById('faceWarning').textContent =
-      'Belum ada wajah terdaftar. Daftarkan wajah di tab Biometrik terlebih dahulu.';
-    showElement('faceWarning');
+async function refreshUserList(preferUsername = null) {
+  const users = await getAllUsers();
+  const sel = $('userSelect');
+  if (!users.length) {
+    sel.innerHTML = '<option value="">— Belum ada user terdaftar —</option>';
+    selectedUser = null;
+    resetFactorStates();
     return;
   }
-
-  hideElement('faceWarning');
-  const btn = document.getElementById('faceStartBtn');
-  btn.disabled    = true;
-  btn.textContent = 'Sedang memindai…';
-
-  const videoEl    = document.getElementById('faceVideo');
-  const canvasEl   = document.getElementById('faceCanvas');
-  const statusText = document.getElementById('faceStatusText');
-
-  await startFaceLogin(
-    videoEl,
-    canvasEl,
-    statusText,
-    // onSuccess
-    () => {
-      // Ambil hash tersimpan; login face tidak memerlukan password asli,
-      // tapi kita butuh sessionPassword untuk enkripsi/dekripsi.
-      // Minta password sekali sebagai fallback setelah face sukses
-      const pw = localStorage.getItem('sn_face_pw_hint');
-      if (pw) {
-        const decryptedHint = atob(pw);
-        unlockApp(decryptedHint);
-        btn.disabled    = false;
-        btn.textContent = 'Mulai Pindai Wajah';
-      } else {
-        // Tidak ada hint → minta user masukkan password tetap
-        switchLockTab('password');
-        showElement('passwordWarning');
-        document.getElementById('passwordWarning').textContent =
-          'Wajah dikenali! Masukkan kata sandi untuk mendekripsi catatan.';
-        btn.disabled    = false;
-        btn.textContent = 'Mulai Pindai Wajah';
-      }
-    },
-    // onFailure
-    (err) => {
-      console.warn('[FaceScan] Login gagal:', err.message);
-      showElement('faceWarning');
-      btn.disabled    = false;
-      btn.textContent = 'Mulai Pindai Wajah';
-    }
-  );
+  sel.innerHTML = users.map(u => `<option value="${esc(u.username)}">👤 ${esc(u.username)} (${esc(u.dongleSerial)})</option>`).join('');
+  const target = preferUsername && users.some(u => u.username === preferUsername) ? preferUsername : users[0].username;
+  sel.value = target;
+  selectedUser = await getUser(target);
+  resetFactorStates();
 }
 
-// ══════════════════════════════════════════════════════════════
-// SECTION 4 — SETUP & UBAH KATA SANDI
-// ══════════════════════════════════════════════════════════════
-
-/** Buka modal setup kata sandi awal. */
-function openSetupModal() {
-  showModal('setupModal');
-  hideElement('setupWarning');
+/** Callback otomatis saat USB flashdrive dicabut (Hardware Removal Policy). */
+async function handleUsbEject(reason) {
+  const who = currentActiveUser || (selectedUser && selectedUser.username) || 'USER';
+  dongleOk = false;
+  activeUsbHandle = null;
+  activeUsbContent = null;
+  if (loggedIn) {
+    await logAction('AUTO_LOCK_USB_EJECT', reason, who);
+    setSession(false);
+    showTab('login');
+  }
+  resetFactorStates();
+  const alertEl = $('lockAlert');
+  alertEl.textContent = `🚨 HARDWARE TOKEN TERPUTUS (${who}): ${reason} — Sesi dikunci otomatis!`;
+  alertEl.classList.remove('hidden');
+  toast('USB Dongle terputus! Sesi dikunci otomatis.', true);
 }
 
-/** Tutup modal setup. */
-function closeSetupModal() {
-  hideModal('setupModal');
-}
+function bindLogin() {
+  $('userSelect').onchange = async () => {
+    $('lockAlert').classList.add('hidden');
+    const uname = $('userSelect').value;
+    selectedUser = uname ? await getUser(uname) : null;
+    resetFactorStates();
+  };
 
-/**
- * Simpan kata sandi master dari modal setup.
- */
-async function saveSetupPassword() {
-  const pw      = document.getElementById('setupPassword').value;
-  const confirm = document.getElementById('setupConfirm').value;
-
-  if (pw.length < 8) {
-    document.getElementById('setupWarning').textContent = 'Kata sandi minimal 8 karakter.';
-    showElement('setupWarning');
-    return;
-  }
-
-  if (pw !== confirm) {
-    document.getElementById('setupWarning').textContent = 'Kata sandi tidak cocok.';
-    showElement('setupWarning');
-    return;
-  }
-
-  const hash = await hashPassword(pw);
-  localStorage.setItem(LS_PWHASH, hash);
-
-  // Simpan hint (base64) agar face scan bisa unlock — ini adalah trade-off
-  // keamanan vs kenyamanan; di produksi gunakan secure enclave
-  localStorage.setItem('sn_face_pw_hint', btoa(pw));
-
-  closeSetupModal();
-  showToast('Kata sandi berhasil diatur!', 'success');
-  document.getElementById('masterPassword').focus();
-}
-
-/**
- * Ubah kata sandi master dari tab Biometrik.
- */
-async function changePassword() {
-  const newPw   = document.getElementById('newPasswordInput').value;
-  const confirm = document.getElementById('confirmPasswordInput').value;
-  const warning = document.getElementById('passwordMismatchWarning');
-
-  if (newPw.length < 8) {
-    warning.textContent = 'Kata sandi minimal 8 karakter.';
-    showElement('passwordMismatchWarning');
-    return;
-  }
-
-  if (newPw !== confirm) {
-    warning.textContent = 'Kata sandi tidak cocok. Periksa kembali.';
-    showElement('passwordMismatchWarning');
-    return;
-  }
-
-  // Peringatan: mengubah kata sandi akan membuat catatan lama tidak bisa didekripsi
-  if (getNotes().length > 0) {
-    const ok = confirm(
-      'PERINGATAN: Mengubah kata sandi akan membuat semua catatan yang sudah ada tidak dapat dibuka. ' +
-      'Pastikan Anda sudah membaca semua catatan penting. Lanjutkan?'
-    );
-    if (!ok) return;
-    // Hapus semua catatan karena tidak kompatibel dengan kunci baru
-    localStorage.setItem(LS_NOTES, '[]');
-    localStorage.setItem('sn_files', '[]');
-  }
-
-  const hash = await hashPassword(newPw);
-  localStorage.setItem(LS_PWHASH, hash);
-  localStorage.setItem('sn_face_pw_hint', btoa(newPw));
-  sessionPassword = newPw;
-
-  hideElement('passwordMismatchWarning');
-  document.getElementById('newPasswordInput').value    = '';
-  document.getElementById('confirmPasswordInput').value = '';
-
-  showToast('Kata sandi berhasil diubah!', 'success');
-  renderNoteList();
-  renderFileList();
-}
-
-// ══════════════════════════════════════════════════════════════
-// SECTION 5 — TAB NAVIGATION
-// ══════════════════════════════════════════════════════════════
-
-/**
- * Beralih antara tab password dan tab face scan di lock screen.
- * @param {'password'|'face'} tab
- */
-function switchLockTab(tab) {
-  const panels = { password: 'panelPassword', face: 'panelFace' };
-  const tabs   = { password: 'tabPassword',   face: 'tabFace'   };
-
-  Object.entries(panels).forEach(([key, id]) => {
-    const el = document.getElementById(id);
-    if (key === tab) el.classList.remove('hidden');
-    else el.classList.add('hidden');
+  // Switch mode dongle: USB Flashdrive vs Upload manual
+  document.querySelectorAll('input[name="dongleMode"]').forEach(r => {
+    r.onchange = () => {
+      const m = getDongleMode();
+      $('dongleUsbBox').classList.toggle('hidden', m !== 'usb');
+      $('dongleUploadBox').classList.toggle('hidden', m !== 'upload');
+      stopUsbWatcher();
+      dongleOk = false;
+      activeUsbHandle = null;
+      activeUsbContent = null;
+      $('dongleFile').value = '';
+      if (selectedUser) setStatus('dongleStatus', `Menunggu verifikasi ${dongleFileName(selectedUser.username)}`);
+      updateLoginHint();
+    };
   });
 
-  Object.entries(tabs).forEach(([key, id]) => {
-    const btn = document.getElementById(id);
-    if (key === tab) {
-      btn.classList.add('bg-primary', 'text-white');
-      btn.classList.remove('text-slate-400');
+  // Mode 1: Real USB Flashdrive Detection
+  $('btnUsbConnect').onclick = () => guard($('btnUsbConnect'), async () => {
+    $('lockAlert').classList.add('hidden');
+    if (!selectedUser) throw new Error('Pilih atau daftarkan akun terlebih dahulu.');
+    const r = await connectUsbDrive(selectedUser.username);
+    dongleOk = r.valid;
+    if (r.valid) {
+      dongleModeUsed = 'usb';
+      activeUsbHandle = r.fileHandle;
+      activeUsbContent = r.content;
+      setStatus('dongleStatus', `✔ USB "${r.driveName}" terhubung · ${r.serial} (Auto-Lock aktif)`, 'ok');
+      startUsbWatcher(r.fileHandle, r.content, handleUsbEject);
     } else {
-      btn.classList.remove('bg-primary', 'text-white');
-      btn.classList.add('text-slate-400');
+      setStatus('dongleStatus', `✖ ${r.reason}`, 'err');
+    }
+    updateLoginHint();
+  });
+
+  // Mode 2: Upload File Manual
+  $('dongleFile').onchange = async (e) => {
+    $('lockAlert').classList.add('hidden');
+    if (!selectedUser) {
+      setStatus('dongleStatus', '✖ Pilih akun terlebih dahulu.', 'err');
+      return;
+    }
+    const r = await checkDongleFile(e.target.files[0], selectedUser.username);
+    dongleOk = r.valid;
+    if (r.valid) dongleModeUsed = 'upload';
+    setStatus('dongleStatus', r.valid ? `✔ ${r.reason} (${r.serial}, mode upload)` : `✖ ${r.reason}`, r.valid ? 'ok' : 'err');
+    updateLoginHint();
+  };
+
+  // Faktor 2: Biometrik Wajah
+  const faceMsg = m => setStatus('faceStatus', m);
+  const faceFail = (e) => {
+    stopFaceScan();
+    setStatus('faceStatus', '✖ ' + (e.message || e) + ' — jika perangkat bermasalah, aktifkan mode simulasi.', 'err');
+    throw e;
+  };
+
+  $('btnFace').onclick = () => guard($('btnFace'), async () => {
+    if (!selectedUser) throw new Error('Pilih akun terlebih dahulu.');
+    faceOk = false;
+    $('faceDist').textContent = '';
+    if ($('faceSim').checked) {
+      await initFaceScan($('faceVideo'), $('faceCanvas'), faceMsg);
+      faceOk = true;
+      faceMode = 'simulasi';
+      setStatus('faceStatus', `⚠ Lolos via MODE SIMULASI untuk "${selectedUser.username}".`, 'ok');
+    } else {
+      try {
+        const r = await verifyUserFace($('faceVideo'), $('faceCanvas'), selectedUser.faceDescriptor, faceMsg);
+        $('faceDist').textContent = `Jarak Euclidean = ${r.distance.toFixed(4)} (batas ≤ ${FACE_MATCH_THRESHOLD}) · kemiripan ${r.similarity.toFixed(1)}%`;
+        if (!r.ok) throw new Error(`Wajah tidak cocok dengan "${selectedUser.username}" (jarak ${r.distance.toFixed(3)} > ${FACE_MATCH_THRESHOLD}).`);
+        faceOk = true;
+        faceMode = 'asli';
+        setStatus('faceStatus', `✔ Wajah cocok dengan "${selectedUser.username}" (biometrik asli).`, 'ok');
+      } catch (e) { faceFail(e); }
+    }
+    updateLoginHint();
+  });
+  $('faceSim').onchange = () => { faceOk = false; updateLoginHint(); };
+
+  // Faktor 3: Master PIN & Login
+  $('btnLogin').onclick = () => guard($('btnLogin'), async () => {
+    if (!selectedUser) throw new Error('Pilih akun terlebih dahulu.');
+    if (!dongleOk) throw new Error('Faktor ① (Dongle) belum terverifikasi.');
+    if (!faceOk) throw new Error('Faktor ② (Biometrik Wajah) belum terverifikasi.');
+    const pinHash = await hashSHA256($('loginPin').value);
+    if (pinHash !== selectedUser.pinHash) throw new Error('Master PIN salah.');
+    $('loginPin').value = '';
+    $('lockAlert').classList.add('hidden');
+    stopFaceScan();
+    setSession(true, selectedUser.username);
+    if (dongleModeUsed === 'usb' && activeUsbHandle) {
+      startUsbWatcher(activeUsbHandle, activeUsbContent, handleUsbEject);
+    }
+    await logAction('LOGIN', `Login 3 faktor berhasil (dongle: ${dongleModeUsed}, wajah: ${faceMode})`, selectedUser.username);
+    toast(`Selamat datang, ${selectedUser.username}!`);
+    showTab('text');
+  });
+
+  $('btnLogout').onclick = async () => {
+    const who = currentActiveUser;
+    stopUsbWatcher();
+    setSession(false);
+    resetFactorStates();
+    if (who) await logAction('LOGOUT', 'User logout manual', who);
+    showTab('login');
+  };
+
+  // ── Modal Registrasi User Baru ──
+  const openRegModal = () => {
+    regFaceDesc = null;
+    $('regUser').value = '';
+    $('regPin').value = '';
+    $('regPin2').value = '';
+    $('regFaceSkip').checked = false;
+    setStatus('regFaceStatus', 'Belum direkam');
+    $('regStatus').classList.add('hidden');
+    $('regModal').classList.remove('hidden');
+  };
+  const closeRegModal = () => {
+    stopFaceScan();
+    $('regModal').classList.add('hidden');
+  };
+
+  $('btnOpenRegister').onclick = openRegModal;
+  $('btnRegClose').onclick = closeRegModal;
+
+  $('btnRegFace').onclick = () => guard($('btnRegFace'), async () => {
+    if ($('regFaceSkip').checked) throw new Error('Hapus centang "Lewati wajah" untuk merekam wajah.');
+    try {
+      const desc = await scanFaceDescriptor($('regVideo'), $('regCanvas'), m => setStatus('regFaceStatus', m), {
+        samples: 5, timeoutMs: 25000, verb: 'Merekam'
+      });
+      regFaceDesc = Array.from(desc);
+      stopFaceScan();
+      const norm = Math.sqrt(regFaceDesc.reduce((s, v) => s + v * v, 0)).toFixed(3);
+      setStatus('regFaceStatus', `✔ Wajah terekam (128-d vector, norm=${norm})`, 'ok');
+    } catch (e) {
+      stopFaceScan();
+      setStatus('regFaceStatus', '✖ ' + (e.message || e), 'err');
+      throw e;
     }
   });
-}
 
-/**
- * Beralih antar tab utama di aplikasi (note, file, bio).
- * @param {'note'|'file'|'bio'} tab
- * @param {HTMLElement}         clickedBtn
- */
-function switchMainTab(tab, clickedBtn) {
-  const sections = ['note', 'file', 'bio'];
+  $('btnRegSubmit').onclick = () => guard($('btnRegSubmit'), async () => {
+    const username = $('regUser').value.trim().toLowerCase();
+    if (!/^[a-z0-9_-]{3,20}$/.test(username)) {
+      throw new Error('Username harus 3–20 karakter (huruf kecil a-z, angka, _ atau -).');
+    }
+    if (await getUser(username)) throw new Error(`Username "${username}" sudah digunakan.`);
+    const pin = $('regPin').value;
+    if (pin.length < 4) throw new Error('Master PIN minimal 4 karakter.');
+    if (pin !== $('regPin2').value) throw new Error('Konfirmasi PIN tidak cocok.');
+    if (!regFaceDesc && !$('regFaceSkip').checked) {
+      throw new Error('Rekam wajah terlebih dahulu, atau centang "Lewati wajah".');
+    }
 
-  sections.forEach(s => {
-    const el = document.getElementById(`tab-${s}`);
-    if (s === tab) el.classList.remove('hidden');
-    else el.classList.add('hidden');
+    const dongle = await generateDongle(username);
+    const saveMode = document.querySelector('input[name="regDongle"]:checked')?.value || 'download';
+    let dongleNote = `file ${dongle.fileName} diunduh`;
+    if (saveMode === 'usb') {
+      try {
+        const driveName = await writeDongleToUsb(dongle);
+        dongleNote = `ditulis langsung ke USB "${driveName}/${dongle.fileName}"`;
+      } catch (e) {
+        // Fallback otomatis ke download bila penulisan ke USB gagal/dibatalkan
+        downloadBlob(dongle.blob, dongle.fileName);
+        dongleNote = `fallback download ${dongle.fileName} (${e.message})`;
+      }
+    } else {
+      downloadBlob(dongle.blob, dongle.fileName);
+    }
+
+    const userRecord = {
+      username,
+      pinHash: await hashSHA256(pin),
+      dongleSerial: dongle.serial,
+      faceDescriptor: regFaceDesc,
+      createdAt: new Date().toISOString(),
+    };
+    await registerUser(userRecord);
+    await logAction('USER_REGISTER', `User "${username}" terdaftar · dongle ${dongle.serial} (${dongleNote}) · wajah: ${regFaceDesc ? '128-d' : 'dilewati'}`, username);
+    closeRegModal();
+    await refreshUserList(username);
+    toast(`User "${username}" terdaftar (${dongleNote}).`);
   });
-
-  // Update gaya tombol tab
-  document.querySelectorAll('.nav-tab').forEach(btn => btn.classList.remove('active'));
-  if (clickedBtn) clickedBtn.classList.add('active');
 }
 
-// ══════════════════════════════════════════════════════════════
-// SECTION 6 — CATATAN
-// ══════════════════════════════════════════════════════════════
-
-// ── Storage ───────────────────────────────────────────────────
-
-/**
- * Mengambil semua catatan dari localStorage.
- * @returns {Array<{id, title, payloadB64, createdAt, updatedAt}>}
- */
-function getNotes() {
-  try {
-    return JSON.parse(localStorage.getItem(LS_NOTES) || '[]');
-  } catch {
-    return [];
-  }
+// ══ TAB 2: SUPER-ENCRYPTION (Vigenère Klasik A-Z Mod 26 + AES-256-GCM) ══════
+let lastCipher = null;
+function bindText() {
+  $('btnTextEnc').onclick = () => guard($('btnTextEnc'), async () => {
+    const text = $('textInput').value;
+    if (!text) throw new Error('Teks kosong.');
+    const r = await superEncryptTrace(text, $('vigKey').value, $('aesKey').value);
+    $('textLayer1').value = r.vigText;
+    $('textOutput').value = r.aes.b64;
+    lastCipher = r.aes.b64;
+    $('textSteps').innerHTML = renderEncryptSteps(r, r.vigKey, $('aesKey').value);
+    await logAction('SUPER_ENCRYPT', `Teks ${text.length} char, SHA256(cipher)=${(await hashSHA256(r.aes.b64)).slice(0, 16)}…`);
+    toast('Enkripsi dua lapis berhasil.');
+  });
+  $('btnTextDec').onclick = () => guard($('btnTextDec'), async () => {
+    const r = await superDecryptTrace($('textInput').value, $('vigKey').value, $('aesKey').value);
+    $('textLayer1').value = r.vigCipher;
+    $('textOutput').value = r.plain;
+    $('textSteps').innerHTML = renderDecryptSteps(r, r.vigKey);
+    toast('Dekripsi berhasil.');
+  });
+  $('btnTextSave').onclick = () => guard($('btnTextSave'), async () => {
+    if (!currentActiveUser) throw new Error('Anda belum login.');
+    if (!lastCipher) throw new Error('Enkripsi teks terlebih dahulu.');
+    await saveVaultText({ username: currentActiveUser, ciphertext: lastCipher, createdAt: new Date().toISOString() });
+    await renderVaultText();
+    toast(`Disimpan ke vault milik "${currentActiveUser}".`);
+  });
+}
+async function renderVaultText() {
+  if (!currentActiveUser) { $('vaultTextList').innerHTML = '<span class="muted">Login terlebih dahulu</span>'; return; }
+  const items = await getVaultTextsByUser(currentActiveUser);
+  $('vaultTextList').innerHTML = items.length
+    ? items.map(i => `<div class="item"><span>#${i.id} · 👤 ${esc(i.username)} · ${esc(i.createdAt)} · ${esc(i.ciphertext.slice(0, 36))}…</span><button class="btn small" data-load="${i.id}">Muat</button></div>`).join('')
+    : `<span class="muted">Vault teks milik "${esc(currentActiveUser)}" masih kosong.</span>`;
+  $('vaultTextList').querySelectorAll('[data-load]').forEach(b => b.onclick = () => {
+    const it = items.find(x => x.id == b.dataset.load);
+    $('textInput').value = it.ciphertext;
+    toast('Ciphertext dimuat ke input. Isi kunci lalu klik Dekripsi.');
+  });
 }
 
-/**
- * Menyimpan array catatan ke localStorage.
- * @param {Array} notes
- */
-function saveNotes(notes) {
-  localStorage.setItem(LS_NOTES, JSON.stringify(notes));
+// ══ TAB 3: FILE CRYPTO (RC4) ═════════════════════════════════════════════════
+let selectedFile = null, fileResult = null;
+function pickFile(f) {
+  selectedFile = f;
+  setStatus('fileInfo', f ? `${f.name} (${fmtBytes(f.size)})` : 'Belum ada file', f ? 'ok' : '');
 }
+function bindFile() {
+  const dz = $('dropzone');
+  dz.onclick = () => $('fileInput').click();
+  $('fileInput').onchange = e => pickFile(e.target.files[0]);
+  dz.ondragover = e => { e.preventDefault(); dz.classList.add('over'); };
+  dz.ondragleave = () => dz.classList.remove('over');
+  dz.ondrop = e => { e.preventDefault(); dz.classList.remove('over'); pickFile(e.dataTransfer.files[0]); };
 
-// ── Render Daftar Catatan ─────────────────────────────────────
-
-/**
- * Merender kartu catatan berdasarkan kata kunci pencarian.
- * Judul ditampilkan plaintext; konten tetap terenkripsi.
- */
-function renderNoteList() {
-  const query   = (document.getElementById('noteSearch')?.value || '').toLowerCase();
-  const notes   = getNotes().filter(n =>
-    n.title.toLowerCase().includes(query)
-  );
-
-  const list    = document.getElementById('noteList');
-  const empty   = document.getElementById('noteEmpty');
-
-  list.innerHTML = '';
-
-  if (notes.length === 0) {
-    showElement('noteEmpty');
-    return;
-  }
-  hideElement('noteEmpty');
-
-  // Urutkan: terbaru teratas
-  notes
-    .slice()
-    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
-    .forEach(note => {
-      const card = document.createElement('div');
-      card.className  = 'note-card group';
-      card.setAttribute('role', 'button');
-      card.setAttribute('tabindex', '0');
-      card.setAttribute('aria-label', `Buka catatan: ${note.title}`);
-
-      card.innerHTML = `
-        <div class="flex items-start justify-between gap-2 mb-2">
-          <h3 class="text-sm font-semibold text-slate-800 leading-tight line-clamp-2 flex-1">
-            ${escapeHtml(note.title) || '<span class="text-slate-400 font-normal">Tanpa judul</span>'}
-          </h3>
-          <!-- Ikon kunci terenkripsi -->
-          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"
-            viewBox="0 0 24 24" class="text-primary shrink-0 mt-0.5" aria-label="Terenkripsi">
-            <path stroke-linecap="round" stroke-linejoin="round"
-              d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
-          </svg>
-        </div>
-        <p class="text-xs text-slate-400">${formatRelativeDate(note.updatedAt)}</p>
-        <!-- Aksi -->
-        <div class="flex gap-1.5 mt-3">
-          <button onclick="viewNote('${note.id}')"
-            class="flex-1 py-1.5 rounded-lg text-xs font-medium bg-slate-50 hover:bg-primary hover:text-white
-                   text-slate-600 border border-border transition-all duration-150">
-            Buka
-          </button>
-          <button onclick="openNoteEditor('${note.id}')"
-            class="py-1.5 px-3 rounded-lg text-xs font-medium bg-slate-50 hover:bg-slate-100
-                   text-slate-600 border border-border transition-all duration-150">
-            Edit
-          </button>
-          <button onclick="deleteNote('${note.id}')"
-            class="py-1.5 px-3 rounded-lg text-xs font-medium border border-red-100 text-red-400
-                   hover:bg-red-50 hover:text-red-600 transition-all duration-150">
-            Hapus
-          </button>
-        </div>
-      `;
-
-      // Keyboard accessible
-      card.addEventListener('keydown', e => {
-        if (e.key === 'Enter' || e.key === ' ') viewNote(note.id);
-      });
-
-      list.appendChild(card);
+  const showResult = (blob, name, msg) => {
+    fileResult = { blob, name };
+    $('btnFileDownload').classList.remove('hidden');
+    setStatus('fileResult', msg, 'ok');
+  };
+  $('btnFileEnc').onclick = () => guard($('btnFileEnc'), async () => {
+    if (!currentActiveUser) throw new Error('Anda belum login.');
+    if (!selectedFile) throw new Error('Pilih file terlebih dahulu.');
+    if (!$('fileKey').value) throw new Error('Kunci RC4 kosong.');
+    const { bytes: enc, trace } = await encryptFileRC4(selectedFile, $('fileKey').value);
+    const hash = await hashSHA256(enc);
+    await saveVaultFile({
+      username: currentActiveUser,
+      originalName: selectedFile.name,
+      size: enc.length,
+      createdAt: new Date().toISOString(),
+      sha256: hash,
+      data: enc.buffer,
     });
+    await logAction('FILE_ENCRYPT_RC4', `${selectedFile.name} (${fmtBytes(selectedFile.size)}), SHA256(enc)=${hash.slice(0, 16)}…`);
+    $('fileSteps').innerHTML = renderRc4Steps(trace, true);
+    showResult(new Blob([enc], { type: 'application/octet-stream' }), selectedFile.name + '.enc', `Terenkripsi → ${selectedFile.name}.enc (${fmtBytes(enc.length)})`);
+    renderVaultFiles();
+  });
+  $('btnFileDec').onclick = () => guard($('btnFileDec'), async () => {
+    if (!selectedFile) throw new Error('Pilih file .enc terlebih dahulu.');
+    if (!$('fileKey').value) throw new Error('Kunci RC4 kosong.');
+    const r = await decryptFileRC4(selectedFile, $('fileKey').value);
+    $('fileSteps').innerHTML = renderRc4Steps(r.trace, false);
+    showResult(new Blob([r.data]), r.name, `Terdekripsi → ${r.name} (${fmtBytes(r.data.length)})`);
+  });
+  $('btnFileDownload').onclick = () => fileResult && downloadBlob(fileResult.blob, fileResult.name);
+}
+async function renderVaultFiles() {
+  if (!currentActiveUser) { $('vaultFileList').innerHTML = '<span class="muted">Login terlebih dahulu</span>'; return; }
+  const items = await getVaultFilesByUser(currentActiveUser);
+  $('vaultFileList').innerHTML = items.length
+    ? items.map(i => `<div class="item"><span>#${i.id} · 👤 ${esc(i.username)} · ${esc(i.originalName)}.enc · ${fmtBytes(i.size)}</span><span><button class="btn small" data-dl="${i.id}">Download</button> <button class="btn small danger" data-del="${i.id}">Hapus</button></span></div>`).join('')
+    : `<span class="muted">Vault file milik "${esc(currentActiveUser)}" masih kosong.</span>`;
+  $('vaultFileList').querySelectorAll('[data-dl]').forEach(b => b.onclick = () => {
+    const it = items.find(x => x.id == b.dataset.dl);
+    downloadBlob(new Blob([it.data]), it.originalName + '.enc');
+  });
+  $('vaultFileList').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    await deleteVaultFile(Number(b.dataset.del));
+    renderVaultFiles();
+  });
 }
 
-// ── Editor Catatan ────────────────────────────────────────────
-
-/**
- * Membuka modal editor catatan.
- * @param {string|null} noteId - null untuk catatan baru
- */
-function openNoteEditor(noteId) {
-  currentEditNoteId = noteId;
-  const title   = document.getElementById('noteModalTitle');
-  const titleIn = document.getElementById('noteTitle');
-  const bodyIn  = document.getElementById('noteContent');
-  const idIn    = document.getElementById('noteEditId');
-
-  titleIn.value = '';
-  bodyIn.value  = '';
-  idIn.value    = '';
-
-  if (noteId) {
-    title.textContent = 'Edit Catatan';
-    idIn.value = noteId;
-    // Judul bisa langsung ditampilkan (tidak dienkripsi)
-    const note = getNotes().find(n => n.id === noteId);
-    if (note) titleIn.value = note.title;
-    // Konten perlu dekripsi
-    decryptNoteForEdit(noteId);
-  } else {
-    title.textContent = 'Catatan Baru';
-  }
-
-  showModal('noteModal');
-  titleIn.focus();
+// ══ TAB 4: STEGANOGRAFI ══════════════════════════════════════════════════════
+let stegoDataUrl = null;
+function bindStego() {
+  $('coverFile').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    $('coverImg').src = (await loadImageFromFile(f)).src;
+    $('coverImg').classList.remove('hidden');
+    $('coverImg').onload = () => setStatus('coverInfo', `${$('coverImg').naturalWidth}×${$('coverImg').naturalHeight} px — kapasitas ±${fmtBytes(stegoCapacity($('coverImg')))}`, 'ok');
+  };
+  $('btnEmbed').onclick = () => guard($('btnEmbed'), async () => {
+    if ($('coverImg').classList.contains('hidden')) throw new Error('Upload cover image dahulu.');
+    const msg = $('stegoMsg').value;
+    if (!msg) throw new Error('Pesan kosong.');
+    const { dataUrl, trace } = embedLSBWithTrace($('coverImg'), msg);
+    stegoDataUrl = dataUrl;
+    $('stegoSteps').innerHTML = renderStegoSteps(trace);
+    $('stegoOut').src = stegoDataUrl;
+    $('stegoOut').classList.remove('hidden');
+    $('btnStegoDownload').classList.remove('hidden');
+    await logAction('STEGO_EMBED', `Pesan ${msg.length} char disisipkan, SHA256(msg)=${(await hashSHA256(msg)).slice(0, 16)}…`);
+    toast('Pesan berhasil disisipkan.');
+  });
+  $('btnStegoDownload').onclick = () => {
+    const a = document.createElement('a'); a.href = stegoDataUrl; a.download = 'stego-image.png'; a.click();
+  };
+  $('stegoFile').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    $('stegoIn').src = (await loadImageFromFile(f)).src;
+    $('stegoIn').classList.remove('hidden');
+  };
+  $('btnExtract').onclick = () => guard($('btnExtract'), async () => {
+    if ($('stegoIn').classList.contains('hidden')) throw new Error('Upload stego image (.png) dahulu.');
+    $('stegoExtracted').value = extractLSB($('stegoIn'));
+    toast('Pesan diekstrak.');
+  });
 }
 
-/**
- * Mendekripsi konten catatan dan mengisinya ke textarea editor.
- * @param {string} noteId
- */
-async function decryptNoteForEdit(noteId) {
-  const note    = getNotes().find(n => n.id === noteId);
-  if (!note) return;
-
-  try {
-    const plain = await decryptText(note.payloadB64, sessionPassword);
-    document.getElementById('noteContent').value = plain;
-  } catch {
-    showToast('Gagal mendekripsi catatan. Periksa kata sandi.', 'error');
-  }
+// ══ TAB 5: LEDGER & DB INSPECTOR ═════════════════════════════════════════════
+async function renderChain() {
+  const res = await ledger.isChainValid();
+  const badge = $('chainBadge');
+  badge.textContent = res.valid ? `✔ VALID · ${ledger.chain.length} blok` : `✖ TAMPERED (blok #${res.at})`;
+  badge.className = 'badge ' + (res.valid ? 'ok' : 'bad');
+  $('chainView').innerHTML = ledger.chain.map((b, i) => `
+    <div class="block ${!res.valid && i >= res.at ? 'bad' : ''}">
+      <b>Block #${b.index}</b> · 👤 <b>${esc(b.username)}</b> · ${esc(b.timestamp)}<br>
+      <b>Data:</b> ${esc(JSON.stringify(b.data))}<br>
+      <b>Prev:</b> <span class="hash">${esc(b.previousHash)}</span><br>
+      <b>Hash:</b> <span class="hash">${esc(b.hash)}</span>
+    </div>`).join('');
 }
 
-/** Tutup modal editor catatan. */
-function closeNoteEditor() {
-  hideModal('noteModal');
-  currentEditNoteId = null;
+function dbReplacer(k, v) {
+  if (v instanceof ArrayBuffer) return `<binary ${v.byteLength} bytes>`;
+  if (v instanceof Uint8Array) return `<binary ${v.length} bytes>`;
+  if (k === 'faceDescriptor' && Array.isArray(v)) return `<float32[128] [${v.slice(0, 3).map(n => Number(n).toFixed(4)).join(', ')}, …]>`;
+  return v;
+}
+async function renderDb() {
+  const store = $('dbStore').value;
+  const all = await getAllDatabaseData();
+  $('dbStats').textContent = Object.entries(all).map(([k, v]) => `${k}: ${v.length}`).join('  |  ');
+  const rows = all[store] || [];
+  const cols = [...new Set(rows.flatMap(r => Object.keys(r)))];
+  $('dbTable').innerHTML = rows.length
+    ? `<tr>${cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>` + rows.map(r => `<tr>${cols.map(c => {
+        const v = r[c];
+        let s = typeof v === 'object' && v !== null ? JSON.stringify(v, (k, val) => dbReplacer(k || c, val)) : String(v ?? '');
+        return `<td>${esc(s.length > 200 ? s.slice(0, 200) + '…' : s)}</td>`;
+      }).join('')}</tr>`).join('')
+    : '<tr><td>(kosong)</td></tr>';
 }
 
-/**
- * Menyimpan catatan (enkripsi konten lalu simpan ke localStorage).
- */
-async function saveNote() {
-  const title   = document.getElementById('noteTitle').value.trim();
-  const content = document.getElementById('noteContent').value;
-  const id      = document.getElementById('noteEditId').value;
-
-  if (!title && !content) {
-    showToast('Judul atau isi catatan tidak boleh kosong.', 'warning');
-    return;
-  }
-
-  try {
-    const payloadB64 = await encryptText(content, sessionPassword);
-    const notes      = getNotes();
-    const now        = new Date().toISOString();
-
-    if (id) {
-      // Update catatan yang ada
-      const idx = notes.findIndex(n => n.id === id);
-      if (idx !== -1) {
-        notes[idx].title      = title || 'Tanpa judul';
-        notes[idx].payloadB64 = payloadB64;
-        notes[idx].updatedAt  = now;
-      }
-    } else {
-      // Catatan baru
-      notes.push({
-        id:         crypto.randomUUID(),
-        title:      title || 'Tanpa judul',
-        payloadB64: payloadB64,
-        createdAt:  now,
-        updatedAt:  now,
-      });
-    }
-
-    saveNotes(notes);
-    closeNoteEditor();
-    renderNoteList();
-    showToast('Catatan berhasil dienkripsi & disimpan!', 'success');
-  } catch (err) {
-    console.error('[saveNote]', err);
-    showToast('Gagal menyimpan catatan.', 'error');
-  }
-}
-
-// ── Lihat Catatan ─────────────────────────────────────────────
-
-/**
- * Membuka modal lihat catatan terdekripsi.
- * @param {string} noteId
- */
-async function viewNote(noteId) {
-  const note = getNotes().find(n => n.id === noteId);
-  if (!note) return;
-
-  document.getElementById('viewNoteTitle').textContent = note.title;
-  document.getElementById('viewNoteDate').textContent  = formatDate(note.updatedAt);
-  document.getElementById('viewNoteContent').textContent = 'Mendekripsi…';
-
-  showModal('viewNoteModal');
-
-  try {
-    const plain = await decryptText(note.payloadB64, sessionPassword);
-    document.getElementById('viewNoteContent').textContent = plain;
-  } catch {
-    document.getElementById('viewNoteContent').textContent = 'Gagal mendekripsi catatan.';
-    showToast('Dekripsi gagal. Periksa kata sandi.', 'error');
-  }
-
-  // Bind tombol Edit
-  document.getElementById('viewNoteEditBtn').onclick = () => {
-    closeViewNote();
-    openNoteEditor(noteId);
+function bindLedger() {
+  $('dbStore').innerHTML = DB_STORES.map(s => `<option>${s}</option>`).join('');
+  $('dbStore').onchange = renderDb;
+  $('btnDbRefresh').onclick = renderDb;
+  $('btnValidate').onclick = async () => {
+    await renderChain();
+    const ok = (await ledger.isChainValid()).valid;
+    toast(ok ? 'Rantai valid.' : 'Rantai tidak valid!', !ok);
+  };
+  $('btnTamper').onclick = async () => {
+    if (ledger.chain.length < 2) { toast('Butuh minimal 2 blok.', true); return; }
+    ledger.chain[1].data = { action: 'TAMPERED', detail: 'data dimanipulasi' };
+    await renderChain();
+    toast('Blok #1 dimodifikasi di memori (DB tidak berubah).', true);
+  };
+  $('btnReloadChain').onclick = async () => { await ledger.load(); await renderChain(); toast('Rantai dimuat ulang dari database.'); };
+  $('btnDbExport').onclick = async () => {
+    const all = await getAllDatabaseData();
+    downloadBlob(new Blob([JSON.stringify(all, dbReplacer, 2)], { type: 'application/json' }), 'secretnote-db-dump.json');
+  };
+  $('btnDbReset').onclick = async () => {
+    if (!confirm('Hapus SELURUH data (semua user, ledger, vault)?')) return;
+    stopUsbWatcher();
+    await clearAllDatabaseData();
+    location.reload();
   };
 }
 
-/** Tutup modal lihat catatan. */
-function closeViewNote() {
-  hideModal('viewNoteModal');
+// ══ RENDERER STEP-BY-STEP ════════════════════════════════════════════════════
+const MAX_ROWS = 24;
+const short = (h, n = 96) => h.length > n ? h.slice(0, n) + `… (${h.length / 2} byte)` : h;
+const hx = (v) => v.toString(16).padStart(2, '0');
+const bin8 = (v) => v.toString(2).padStart(8, '0');
+const stepBox = (n, title, body) => `<div class="step"><div class="step-n">${n}</div><div class="step-b"><h4>${title}</h4>${body}</div></div>`;
+const kv = (label, val) => `<div class="kv"><span>${label}</span><code>${esc(val)}</code></div>`;
+const note = (t) => `<p>${t}</p>`;
+const table = (head, rows) => `<div class="mini-wrap"><table class="mini"><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</table></div>`;
+const vis = (s) => s === ' ' ? '␣' : esc(s);
+
+function vigTable(steps, dir) {
+  const inCol = dir > 0 ? 'P (0..25)' : 'C (0..25)';
+  const outCol = dir > 0 ? 'C (0..25)' : 'P (0..25)';
+  const rows = steps.slice(0, MAX_ROWS).map(s => s.isAlpha
+    ? [vis(s.char), s.p, vis(s.keyChar), s.keyShift,
+       dir > 0 ? `(${s.p} + ${s.keyShift}) mod 26 = ${s.c}` : `(${s.p} − ${s.keyShift} + 26) mod 26 = ${s.c}`,
+       vis(s.resChar), s.c]
+    : [vis(s.char), '—', '—', '—', 'pass-through (non-alfabet)', vis(s.resChar), '—']);
+  const more = steps.length > MAX_ROWS ? note(`Menampilkan ${MAX_ROWS} dari ${steps.length} karakter.`) : '';
+  return table(['Huruf', inCol, 'Kunci', 'K (0..25)', 'Rumus Mod 26', 'Hasil', outCol], rows) + more;
 }
 
-// ── Hapus Catatan ─────────────────────────────────────────────
-
-/**
- * Menghapus catatan setelah konfirmasi.
- * @param {string} noteId
- */
-function deleteNote(noteId) {
-  const note = getNotes().find(n => n.id === noteId);
-  if (!note) return;
-
-  const ok = confirm(`Hapus catatan "${note.title}"? Tindakan ini tidak bisa dibatalkan.`);
-  if (!ok) return;
-
-  const notes = getNotes().filter(n => n.id !== noteId);
-  saveNotes(notes);
-  renderNoteList();
-  showToast('Catatan dihapus.', 'info');
+function aesParams(a, maskedKey) {
+  return kv('PBKDF2', `HMAC-SHA256, ${a.iterations.toLocaleString()} iterasi, passphrase "${maskedKey}"`)
+    + kv('Salt (16 B)', a.saltHex) + kv('Derived Key (256 b)', a.keyHex) + kv('IV (12 B)', a.ivHex);
 }
 
-// ══════════════════════════════════════════════════════════════
-// SECTION 7 — FILE TERENKRIPSI
-// ══════════════════════════════════════════════════════════════
+const pkgBar = (a) => `<div class="pkg"><span class="p1">Salt 16B</span><span class="p2">IV 12B</span><span class="p3">Ciphertext ${a.ctHex.length / 2}B</span><span class="p4">Tag 16B</span></div>`;
 
-/**
- * Merender daftar file terenkripsi yang tersimpan.
- */
-function renderFileList() {
-  const files = getStoredFiles();
-  const list  = document.getElementById('fileList');
-  const empty = document.getElementById('fileEmpty');
-
-  list.innerHTML = '';
-
-  if (files.length === 0) {
-    showElement('fileEmpty');
-    return;
-  }
-  hideElement('fileEmpty');
-
-  files
-    .slice()
-    .sort((a, b) => new Date(b.encryptedAt) - new Date(a.encryptedAt))
-    .forEach(file => {
-      const item = document.createElement('div');
-      item.className = 'file-item';
-      item.innerHTML = `
-        <!-- Ikon file -->
-        <div class="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
-          <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"
-            viewBox="0 0 24 24" class="text-primary" aria-hidden="true">
-            <path stroke-linecap="round" stroke-linejoin="round"
-              d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414
-                 a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
-          </svg>
-        </div>
-        <!-- Info -->
-        <div class="flex-1 min-w-0">
-          <p class="text-sm font-medium text-slate-800 truncate">${escapeHtml(file.originalName)}</p>
-          <p class="text-xs text-slate-400">${formatFileSize(file.size)} · ${formatDate(file.encryptedAt)}</p>
-        </div>
-        <!-- Aksi -->
-        <div class="flex gap-1.5 shrink-0">
-          <button onclick="downloadFile('${file.id}')"
-            class="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium
-                   bg-primary/10 hover:bg-primary text-primary hover:text-white
-                   transition-all duration-150">
-            <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2"
-              viewBox="0 0 24 24" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
-            </svg>
-            Unduh
-          </button>
-          <button onclick="removeFile('${file.id}')"
-            class="px-2.5 py-1.5 rounded-lg text-xs font-medium border border-red-100 text-red-400
-                   hover:bg-red-50 hover:text-red-600 transition-all duration-150"
-            aria-label="Hapus file ${escapeHtml(file.originalName)}">
-            <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2"
-              viewBox="0 0 24 24" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5
-                   4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
-            </svg>
-          </button>
-        </div>
-      `;
-      list.appendChild(item);
-    });
+function renderEncryptSteps(r, vigKey, aesKey) {
+  const a = r.aes;
+  return [
+    stepBox(1, 'Input', kv('Plaintext', r.plaintext) + kv('Kunci Vigenère (A–Z)', vigKey) + kv('Kunci AES', '•'.repeat(aesKey.length) + ` (${aesKey.length} karakter)`) + kv('Panjang', `${r.plaintext.length} karakter / ${a.inputLen} byte`)),
+    stepBox(2, 'Lapis 1 — Vigenère Cipher Klasik (A–Z, Modulo 26)', note('Huruf alfabet dipetakan A=0 … Z=25 lalu digeser C = (P + K) mod 26. Karakter non-huruf (spasi, angka, simbol) di-bypass (pass-through) sesuai teori klasik.') + vigTable(r.vigSteps, 1) + kv('Hasil perantara', r.vigText)),
+    stepBox(3, 'Lapis 2 — AES-256-GCM (Modern)', note('Kunci 256-bit diturunkan dari passphrase memakai PBKDF2 + salt acak, lalu seluruh teks perantara (termasuk angka/simbol) dienkripsi AES-GCM.') + aesParams(a, '•'.repeat(aesKey.length)) + kv('Ciphertext (hex)', short(a.ctHex)) + kv('Auth Tag (16 B)', a.tagHex)),
+    stepBox(4, 'Packaging → Base64', note('Payload = Salt | IV | Ciphertext | Tag, lalu di-encode Base64 (' + a.payloadLen + ' byte).') + pkgBar(a) + kv('Ciphertext akhir', a.b64)),
+  ].join('');
 }
 
-// ── Upload & Enkripsi File ────────────────────────────────────
-
-/** Handler saat file dipilih via input[type=file]. */
-function handleFileSelect(event) {
-  const files = Array.from(event.target.files);
-  files.forEach(processFileUpload);
-  event.target.value = '';
+function renderDecryptSteps(r, vigKey) {
+  const a = r.aes;
+  return [
+    stepBox(1, 'Unpack Base64', note(`Base64 di-decode menjadi ${a.payloadLen} byte lalu dipisah:`) + pkgBar(a) + kv('Salt', a.saltHex) + kv('IV', a.ivHex) + kv('Auth Tag', a.tagHex)),
+    stepBox(2, 'Lapis 2 (dibalik) — AES-256-GCM Decrypt', note('Kunci diturunkan ulang dari passphrase + salt yang sama. Tag diverifikasi; jika kunci salah / data diubah, dekripsi gagal.') + kv('PBKDF2', `HMAC-SHA256, ${a.iterations.toLocaleString()} iterasi`) + kv('Derived Key (256 b)', a.keyHex) + kv('Ciphertext (hex)', short(a.ctHex)) + kv('Hasil (Vigenère cipher)', r.vigCipher)),
+    stepBox(3, `Lapis 1 (dibalik) — Vigenère Klasik Decrypt (kunci "${esc(vigKey)}")`, note('Huruf dikembalikan dengan rumus P = (C − K + 26) mod 26; karakter non-huruf tetap.') + vigTable(r.vigSteps, -1)),
+    stepBox(4, 'Plaintext', kv('Plaintext', r.plain)),
+  ].join('');
 }
 
-/** Handler drag-over: ubah visual drop zone. */
-function handleFileDragOver(event) {
-  event.preventDefault();
-  document.getElementById('fileDropZone').classList.add('border-primary', 'bg-primary/10');
+function renderRc4Steps(t, encrypt) {
+  const arr = (a) => a.map(hx).join(' ');
+  const inLabel = encrypt ? 'Plaintext' : 'Ciphertext', outLabel = encrypt ? 'Ciphertext' : 'Plaintext';
+  const p = t.package;
+  return [
+    stepBox(1, 'KSA — Key Scheduling Algorithm', note('S-Box diinisialisasi S[i]=i, lalu diacak 256 putaran: j = (j + S[i] + key[i mod len]) mod 256; swap(S[i], S[j]).') + kv('Kunci (byte)', arr(t.keyBytes)) + kv('S[0..15] sebelum', arr(t.sBefore)) + kv('S[0..15] sesudah', arr(t.sAfter))),
+    stepBox(2, 'PRGA — Keystream Generator', note('Tiap byte: i++, j += S[i], swap(S[i],S[j]), K = S[(S[i]+S[j]) mod 256].') + kv('Keystream 16 byte', arr(t.keystream))),
+    stepBox(3, `XOR Bitwise — ${inLabel} ⊕ Keystream = ${outLabel}`, note(`10 byte pertama dari paket (diawali header "RC4F").`) + table(['#', `${inLabel} hex`, 'biner', 'Keystream', 'biner', `${outLabel} hex`, 'biner'],
+      t.rows.map(r => [r.index, hx(r.input), bin8(r.input), hx(r.keystream), bin8(r.keystream), hx(r.output), bin8(r.output)]))),
+    stepBox(4, encrypt ? 'Packaging file .enc' : 'Unpack paket', `<div class="pkg"><span class="p1">Magic "${p.magic}" 4B</span><span class="p2">Nama len ${p.nameLen} → 2B</span><span class="p3">Nama "${esc(p.name)}" ${p.nameLen}B</span><span class="p4">Data ${p.dataLen}B</span></div>` + kv('Total', `${p.totalLen} byte (seluruhnya dienkripsi RC4)`)),
+  ].join('');
 }
 
-/** Handler drag-leave: kembalikan visual drop zone. */
-function handleFileDragLeave(event) {
-  document.getElementById('fileDropZone').classList.remove('border-primary', 'bg-primary/10');
+function bitsLsb(v, changed) {
+  const b = bin8(v);
+  return `${b.slice(0, 7)}<span class="lsb ${changed ? '' : 'same'}">${b[7]}</span>`;
 }
 
-/** Handler drop: ambil file dari drag event. */
-function handleFileDrop(event) {
-  event.preventDefault();
-  handleFileDragLeave(event);
-  const files = Array.from(event.dataTransfer.files);
-  files.forEach(processFileUpload);
+function renderStegoSteps(t) {
+  const ratio = ((t.totalBitLen / t.capacityBits) * 100).toFixed(3);
+  const pixRows = [];
+  t.pixels.forEach(p => ['R', 'G', 'B'].forEach((ch, i) => {
+    const changed = (p.before[i] & 1) !== (p.after[i] & 1);
+    pixRows.push([`#${p.index} ${ch}`, p.before[i], bitsLsb(p.before[i], false), `<b>${p.bits[i]}</b>`, p.after[i], bitsLsb(p.after[i], changed), changed ? 'berubah' : 'tetap']);
+  }));
+  return [
+    stepBox(1, 'Pesan → Bit', note('Pesan di-encode UTF-8, tiap byte menjadi 8 bit, lalu ditutup delimiter.') + table(['Char', 'Biner'], t.firstChars.map(c => [vis(c.char), c.bin])) + kv('Delimiter', t.delimiter) + kv('Total bit', `${t.messageBitLen} (pesan) + ${t.delimiter.length} (delimiter) = ${t.totalBitLen}`)),
+    stepBox(2, 'Pixel Bit Inspector — LSB sebelum vs sesudah', note('Bit terakhir (LSB, disorot) tiap kanal R/G/B diganti dengan bit pesan. Perubahan maksimal ±1 sehingga tidak terlihat mata.') + table(['Piksel/Kanal', 'Sebelum', 'Biner', 'Bit pesan', 'Sesudah', 'Biner', 'Status'], pixRows)),
+    stepBox(3, 'Kapasitas & Output', kv('Dimensi', `${t.width}×${t.height} px`) + kv('Kapasitas', `${t.capacityBits} bit (${t.capacityBytes} byte)`) + kv('Terpakai', `${t.totalBitLen} bit (${ratio}%)`) + note('Disimpan sebagai PNG (lossless) agar bit LSB tidak rusak oleh kompresi.')),
+  ].join('');
 }
 
-/**
- * Memproses satu file: validasi ukuran → enkripsi → render.
- * @param {File} file
- */
-async function processFileUpload(file) {
-  if (file.size > MAX_FILE_BYTES) {
-    showElement('fileSizeWarning');
-    setTimeout(() => hideElement('fileSizeWarning'), 4000);
-    return;
-  }
-
-  // Buat item progress sementara di daftar
-  const progressId  = `prog-${Date.now()}`;
-  const progressEl  = document.createElement('div');
-  progressEl.id     = progressId;
-  progressEl.className = 'file-item';
-  progressEl.innerHTML = `
-    <div class="w-9 h-9 rounded-lg bg-slate-100 flex items-center justify-center shrink-0">
-      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"
-        viewBox="0 0 24 24" class="spin text-primary" aria-hidden="true">
-        <path stroke-linecap="round" stroke-linejoin="round"
-          d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
-      </svg>
-    </div>
-    <div class="flex-1 min-w-0">
-      <p class="text-sm font-medium text-slate-700 truncate">${escapeHtml(file.name)}</p>
-      <div class="file-progress-bar mt-1">
-        <div class="file-progress-fill" id="${progressId}-fill" style="width:0%"></div>
-      </div>
-    </div>
-  `;
-
-  // Pastikan daftar file terlihat
-  hideElement('fileEmpty');
-  document.getElementById('fileList').prepend(progressEl);
-
+// ══ INIT ═════════════════════════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', async () => {
+  document.querySelectorAll('.tab').forEach(t => t.onclick = () => showTab(t.dataset.tab));
+  bindLogin(); bindText(); bindFile(); bindStego(); bindLedger();
   try {
-    await encryptFile(file, sessionPassword, (pct) => {
-      const fill = document.getElementById(`${progressId}-fill`);
-      if (fill) fill.style.width = `${pct}%`;
-    });
-
-    // Hapus item progress, render ulang dari storage
-    progressEl.remove();
-    renderFileList();
-    showToast(`"${file.name}" berhasil dienkripsi!`, 'success');
-  } catch (err) {
-    progressEl.remove();
-    renderFileList();
-    showToast(`Gagal mengenkripsi "${file.name}": ${err.message}`, 'error');
+    await initDB();
+    await ledger.load();
+    await refreshUserList();
+    renderChain();
+  } catch (e) {
+    toast('Gagal inisialisasi database: ' + e.message, true);
+    console.error(e);
   }
-}
-
-/**
- * Mendekripsi dan mengunduh file.
- * @param {string} fileId
- */
-async function downloadFile(fileId) {
-  const meta = getStoredFiles().find(f => f.id === fileId);
-  if (!meta) return;
-
-  showToast(`Mendekripsi "${meta.originalName}"…`, 'info');
-
-  try {
-    await decryptAndDownloadFile(fileId, sessionPassword);
-    showToast(`"${meta.originalName}" berhasil diunduh!`, 'success');
-  } catch (err) {
-    showToast(`Gagal mengunduh: ${err.message}`, 'error');
-  }
-}
-
-/**
- * Menghapus file terenkripsi dari localStorage.
- * @param {string} fileId
- */
-function removeFile(fileId) {
-  const meta = getStoredFiles().find(f => f.id === fileId);
-  if (!meta) return;
-
-  const ok = confirm(`Hapus file "${meta.originalName}"? Tindakan ini tidak bisa dibatalkan.`);
-  if (!ok) return;
-
-  deleteEncryptedFile(fileId);
-  renderFileList();
-  showToast('File dihapus.', 'info');
-}
-
-// ══════════════════════════════════════════════════════════════
-// SECTION 8 — BIOMETRIK (Tab Bio)
-// ══════════════════════════════════════════════════════════════
-
-/**
- * Mengaktifkan kamera di tab registrasi wajah.
- */
-async function startBioCamera() {
-  const videoEl  = document.getElementById('bioVideo');
-  const statusEl = document.getElementById('bioStatusText');
-
-  try {
-    await startBioCameraStream(videoEl, statusEl);
-  } catch (err) {
-    // Pesan error sudah diset ke statusEl oleh startBioCameraStream
-    // Tampilkan juga sebagai toast agar terlihat jelas
-    showToast(err.message || 'Kamera gagal diaktifkan.', 'error');
-  }
-}
-
-/**
- * Menangkap & mendaftarkan wajah dari kamera.
- */
-async function registerFace() {
-  const videoEl    = document.getElementById('bioVideo');
-  const canvasEl   = document.getElementById('bioCanvas');
-  const statusEl   = document.getElementById('bioStatusText');
-  const warningEl  = document.getElementById('bioRegisterWarning');
-
-  if (!videoEl.srcObject) {
-    showToast('Aktifkan kamera terlebih dahulu.', 'warning');
-    return;
-  }
-
-  hideElement('bioRegisterWarning');
-
-  const success = await captureFaceDescriptor(videoEl, canvasEl, statusEl);
-
-  if (success) {
-    updateBioStatus();
-    showToast('Wajah berhasil didaftarkan!', 'success');
-  } else {
-    showElement('bioRegisterWarning');
-  }
-}
-
-/**
- * Menghapus data wajah yang tersimpan.
- */
-function deleteFaceData() {
-  if (!hasFaceData()) return;
-
-  const ok = confirm('Hapus data wajah? Anda tidak bisa login dengan face scan setelahnya.');
-  if (!ok) return;
-
-  removeFaceData();
-  updateBioStatus();
-  showElement('bioDeleteWarning');
-  setTimeout(() => hideElement('bioDeleteWarning'), 4000);
-  showToast('Data wajah dihapus.', 'info');
-}
-
-/**
- * Memperbarui kartu status biometrik di tab Bio.
- */
-function updateBioStatus() {
-  const dot = document.getElementById('bioStatusDot');
-  const msg = document.getElementById('bioStatusMsg');
-  if (!dot || !msg) return;
-
-  if (hasFaceData()) {
-    dot.className    = 'w-2.5 h-2.5 rounded-full bg-green-500 shrink-0';
-    msg.textContent  = 'Data wajah terdaftar. Login face scan aktif.';
-    msg.className    = 'text-sm text-green-700 font-medium';
-  } else {
-    dot.className    = 'w-2.5 h-2.5 rounded-full bg-slate-300 shrink-0';
-    msg.textContent  = 'Belum ada data wajah terdaftar.';
-    msg.className    = 'text-sm text-slate-600';
-  }
-}
-
-// ══════════════════════════════════════════════════════════════
-// SECTION 9 — TOAST NOTIFIKASI
-// ══════════════════════════════════════════════════════════════
-
-/**
- * Menampilkan notifikasi toast.
- * @param {string} message          - Pesan
- * @param {'success'|'error'|'info'|'warning'} type
- * @param {number} duration         - Durasi tampil (ms), default 3500
- */
-function showToast(message, type = 'info', duration = 3500) {
-  const container = document.getElementById('toastContainer');
-  const toast     = document.createElement('div');
-  toast.className = `toast ${type}`;
-
-  // Ikon per tipe
-  const icons = {
-    success: '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>',
-    error:   '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>',
-    warning: '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>',
-    info:    '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01"/><circle cx="12" cy="12" r="10"/></svg>',
-  };
-
-  toast.innerHTML = `${icons[type] || icons.info}<span>${escapeHtml(message)}</span>`;
-  container.appendChild(toast);
-
-  setTimeout(() => {
-    toast.classList.add('fade-out');
-    toast.addEventListener('animationend', () => toast.remove());
-  }, duration);
-}
-
-// ══════════════════════════════════════════════════════════════
-// SECTION 10 — MODAL HELPERS
-// ══════════════════════════════════════════════════════════════
-
-/** Tampilkan modal. */
-function showModal(id) {
-  document.getElementById(id).classList.remove('hidden');
-}
-
-/** Sembunyikan modal. */
-function hideModal(id) {
-  document.getElementById(id).classList.add('hidden');
-}
-
-// Tutup modal saat klik backdrop
-document.querySelectorAll('[id$="Modal"]').forEach(modal => {
-  modal.addEventListener('click', e => {
-    if (e.target === modal) {
-      modal.classList.add('hidden');
-    }
-  });
 });
-
-// ══════════════════════════════════════════════════════════════
-// SECTION 11 — DOM HELPERS
-// ══════════════════════════════════════════════════════════════
-
-/** Tampilkan elemen (hapus hidden). */
-function showElement(id) {
-  document.getElementById(id)?.classList.remove('hidden');
-}
-
-/** Sembunyikan elemen (tambah hidden). */
-function hideElement(id) {
-  document.getElementById(id)?.classList.add('hidden');
-}
-
-/**
- * Escape karakter HTML khusus untuk mencegah XSS.
- * @param {string} str
- * @returns {string}
- */
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-/**
- * Format tanggal ISO menjadi string lokal yang mudah dibaca.
- * @param {string} iso
- * @returns {string}
- */
-function formatDate(iso) {
-  return new Date(iso).toLocaleString('id-ID', {
-    day: '2-digit', month: 'short', year: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  });
-}
-
-/**
- * Format tanggal relatif (baru saja, X menit lalu, dll).
- * @param {string} iso
- * @returns {string}
- */
-function formatRelativeDate(iso) {
-  const diff = Date.now() - new Date(iso).getTime();
-  const min  = Math.floor(diff / 60_000);
-  const hr   = Math.floor(min / 60);
-  const day  = Math.floor(hr / 24);
-
-  if (min < 1)   return 'Baru saja';
-  if (min < 60)  return `${min} menit lalu`;
-  if (hr  < 24)  return `${hr} jam lalu`;
-  if (day < 7)   return `${day} hari lalu`;
-  return formatDate(iso);
-}
