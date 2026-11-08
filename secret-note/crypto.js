@@ -103,7 +103,13 @@ async function aesEncryptTrace(plaintext, key) {
   const iv = crypto.getRandomValues(new Uint8Array(AES_IV_BYTES));
   const keyBits = await _deriveBits(key, salt);
   const k = await _aesKeyFromBits(keyBits);
-  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, strToBytes(plaintext)));
+  const ct = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv }, 
+      k, 
+      strToBytes(plaintext)
+    )
+  );
   const payload = new Uint8Array(salt.length + iv.length + ct.length);
   payload.set(salt, 0);
   payload.set(iv, salt.length);

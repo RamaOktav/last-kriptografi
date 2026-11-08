@@ -38,7 +38,7 @@
     Matches when $\text{Distance} \le 0.50$.
   - Includes a fallback visual simulation mode for hardware without webcams.
 - **Factor 3 (Knowledge) — Master PIN**:
-  - Verified against a salted SHA-256 digest via Web Crypto API.
+  - Verified against a SHA-256 digest via Web Crypto API.
 
 ### 2. 📜 Tab 2: Super-Encryption (Classic + Modern) & Educational Tracer
 - **Two-Layer Pipeline**:

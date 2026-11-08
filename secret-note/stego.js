@@ -98,10 +98,13 @@ function extractLSB(imageElement) {
     if (i % 4 === 3) continue;
     cur = (cur << 1) | (px[i] & 1);
     if (++n === 8) {
-      if (cur === 0xFF) { // awal delimiter (0xFF 0xFE); 0xFF tidak mungkin muncul di UTF-8
+      bytes.push(cur);
+      if (bytes.length >= 2 &&
+          bytes[bytes.length - 2] === 0xFF &&
+          bytes[bytes.length - 1] === 0xFE) {
+        bytes.splice(-2);
         return new TextDecoder().decode(new Uint8Array(bytes));
       }
-      bytes.push(cur);
       cur = 0; n = 0;
     }
   }
