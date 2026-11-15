@@ -86,14 +86,16 @@
 
 ```
 secret-note/
-├── index.html        # Modern Cybersecurity Dark Theme UI & Tab Controller
-├── style.css         # Responsive styling, step breakdown panels, modal layout
-├── db.js             # IndexedDB engine (SecretNoteCryptoDB v2, Multi-Tenant)
-├── crypto.js         # SHA-256, Classic Vigenère (A-Z mod 26), AES-256-GCM, Tracer
+├── server.js         # Zero-dependency Node.js HTTP Server + SQLite Engine (secret-note.db) & Web DB Studio (/db-admin)
+├── index.html        # Industrial Vault UI (Separated Gatekeeper & 2-Column Workspace)
+├── style.css         # Monokrom Taktis styling, collapsible step drawers, lockdown banner
+├── db.js             # Dual-engine storage client (SQLite REST API primary + IndexedDB fallback)
+├── crypto.js         # SHA-256, Classic Vigenère (A-Z mod 26), AES-256-GCM with AAD Owner Binding
 ├── file-crypto.js    # RC4 Stream Cipher (KSA, PRGA, XOR), .enc packaging
-├── face-scan.js      # Dual-mode Dongle (Web File System Access) & face-api.js
-├── stego.js          # Canvas LSB Image Steganography & Pixel Bit Inspector
-└── app.js            # Blockchain ledger class, state management, UI orchestrator
+├── face-scan.js      # Dongle-First 3FA (Web File System Access + .key Upload) & local face-api.js
+├── stego.js          # LSB Steganography + Adaptive 24-bit RGB PNG Encoder + 0-Byte Size Camouflage
+├── app.js            # Blockchain ledger, Active Tamper Lockdown, session isolation & UI controller
+└── models/           # Offline AI weights (.weights & manifest JSON) for fast biometric recognition
 ```
 
 ---
@@ -101,28 +103,23 @@ secret-note/
 ## 🚀 Getting Started
 
 ### Prerequisites
-- A modern Chromium-based web browser (**Google Chrome** or **Microsoft Edge**) to support the Web File System Access API and Web Camera streams.
-- A local HTTP server (browsers restrict camera and file-system APIs under `file://`).
+- **Node.js v22+** (recommended, uses built-in `node:sqlite` with zero `npm install` needed).
+- A modern Chromium-based web browser (**Google Chrome** or **Microsoft Edge**) for Web File System Access API and WebRTC camera support.
 
-### Running Locally
-You can serve the directory using any lightweight server:
+### Running Locally (Recommended — Full SQLite Server & Web DB Admin)
+From the repository root, run:
+```bash
+node secret-note/server.js
+```
+Then open:
+- **Main Vault Application**: `http://localhost:3000`
+- **SQLite Web Console (phpMyAdmin-style GUI)**: `http://localhost:3000/db-admin`
 
-**Using Node.js (`npx serve`):**
+### Static Server Fallback (IndexedDB Mode)
+If you run without `server.js`, the application automatically falls back to browser **IndexedDB**:
 ```bash
 npx serve secret-note
 ```
-
-**Using Python:**
-```bash
-cd secret-note
-python -m http.server 8000
-```
-
-**Using VS Code:**
-- Install the **Live Server** extension.
-- Right-click `secret-note/index.html` and select **"Open with Live Server"**.
-
-Visit `http://localhost:8000` (or the port indicated) in your browser.
 
 ---
 
@@ -199,25 +196,22 @@ Visit `http://localhost:8000` (or the port indicated) in your browser.
 - Web browser modern berbasis Chromium (**Google Chrome** atau **Microsoft Edge**) untuk mendukung Web File System Access API dan akses streaming webcam.
 - Web server lokal (API kamera dan File System dibatasi browser jika dibuka langsung via protokol `file://`).
 
-### Menjalankan Server Lokal
-Pilih salah satu metode berikut di folder repositori:
+### Menjalankan Server Lokal (Direkomendasikan — Mode SQLite Penuh)
+Jalankan perintah berikut dari folder utama repositori (menggunakan **Node.js v22+** bawaan tanpa perlu `npm install`):
 
-**Menggunakan Node.js:**
+```bash
+node secret-note/server.js
+```
+
+Kemudian buka di browser:
+- **Aplikasi Brankas Utama**: `http://localhost:3000`
+- **SQLite Studio Web Console (Mirip phpMyAdmin)**: `http://localhost:3000/db-admin`
+- **File Database Fisik**: `secret-note/secret-note.db` (juga dapat dibuka dengan *DB Browser for SQLite* atau ekstensi VS Code)
+
+**Alternatif Static Server (Otomatis Fallback ke IndexedDB):**
 ```bash
 npx serve secret-note
 ```
-
-**Menggunakan Python:**
-```bash
-cd secret-note
-python -m http.server 8000
-```
-
-**Menggunakan Visual Studio Code:**
-- Pasang ekstensi **Live Server**.
-- Klik kanan pada `secret-note/index.html` dan pilih **"Open with Live Server"**.
-
-Buka alamat `http://localhost:8000` (atau port yang ditampilkan) pada browser Anda.
 
 ---
 

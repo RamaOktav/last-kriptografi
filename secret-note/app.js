@@ -1,12 +1,18 @@
 /**
- * app.js — Secret Note
- * Multi-User Orchestration, Dual-Mode USB Dongle (with Auto-Lock on Eject),
- * Real Face Biometrics, Vigenère Klasik A-Z Mod 26 Tracer, & Blockchain Ledger.
+ * app.js — Secret Note (Industrial Vault Edition)
+ * Mengelola:
+ *   • Gatekeeper Dongle-First 3FA (USB Hardware / File .key + Real Face Biometrics + PIN SHA-256)
+ *   • Pemisahan layar Gatekeeper vs Workspace Brankas & Sanitasi Memori saat Kunci Brankas
+ *   • Super-Enkripsi (Vigenère Klasik A-Z Mod 26 + AES-256-GCM dengan AAD Owner Binding)
+ *   • Enkripsi Berkas RC4, Steganografi LSB, dan Blockchain Audit Ledger
+ *   • Penyimpanan ke SQLite Server (secret-note.db) dengan fallback IndexedDB
  */
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+}[c]));
 
 // ══ STATE SESSI & MULTI-USER ═════════════════════════════════════════════════
 let currentActiveUser = null;
@@ -23,7 +29,9 @@ class Block {
     this.hash = '';
   }
   async calculateHash() {
-    return hashSHA256(this.index + '|' + this.timestamp + '|' + this.username + '|' + JSON.stringify(this.data) + '|' + this.previousHash);
+    return hashSHA256(
+      this.index + '|' + this.timestamp + '|' + this.username + '|' + JSON.stringify(this.data) + '|' + this.previousHash
+    );
   }
   static async create(index, timestamp, username, data, previousHash = '') {
     const b = new Block(index, timestamp, username, data, previousHash);
@@ -37,16 +45,53 @@ class Block {
   }
 }
 
+const LEDGER_BACKUP_KEY = 'secretNote_ledgerOriginalSnapshot_v1';
+
 class Blockchain {
-  constructor() { this.chain = []; }
+  constructor() {
+    this.chain = [];
+    this.originalSnapshot = this._loadBackupStorage();
+  }
+  _loadBackupStorage() {
+    try {
+      const raw = localStorage.getItem(LEDGER_BACKUP_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  }
+  _saveBackupStorage() {
+    try {
+      localStorage.setItem(LEDGER_BACKUP_KEY, JSON.stringify(this.originalSnapshot));
+    } catch { /* abaikan quota */ }
+  }
+  _backupValidBlock(blk) {
+    this.originalSnapshot[blk.index] = {
+      index: blk.index,
+      timestamp: blk.timestamp,
+      username: blk.username,
+      data: JSON.parse(JSON.stringify(blk.data)),
+      previousHash: blk.previousHash,
+      hash: blk.hash,
+    };
+    this._saveBackupStorage();
+  }
+  clearBackupStorage() {
+    this.originalSnapshot = {};
+    try { localStorage.removeItem(LEDGER_BACKUP_KEY); } catch { /* ignore */ }
+  }
   async createGenesisBlock() {
-    return Block.create(0, new Date().toISOString(), 'SYSTEM', { action: 'GENESIS', detail: 'Secret Note Multi-User Ledger' }, '0');
+    return Block.create(0, new Date().toISOString(), 'SYSTEM', {
+      action: 'GENESIS',
+      detail: 'Inisialisasi Rantai Audit Brankas Secret Note',
+    }, '0');
   }
   getLatestBlock() { return this.chain[this.chain.length - 1]; }
   async addBlock(newBlock) {
     newBlock.previousHash = this.getLatestBlock().hash;
     newBlock.hash = await newBlock.calculateHash();
     this.chain.push(newBlock);
+    this._backupValidBlock(newBlock);
     await addBlockToDB(newBlock);
     return newBlock;
   }
@@ -58,25 +103,113 @@ class Blockchain {
     }
     return { valid: true };
   }
+  async tamperBlock(index, newData) {
+    const blk = this.chain[index];
+    if (!blk) return false;
+    // Pastikan data asli tersimpan di snapshot sebelum dimanipulasi
+    if (blk.hash === await blk.calculateHash() && !this.originalSnapshot[index]) {
+      this._backupValidBlock(blk);
+    }
+    blk.data = newData;
+    await addBlockToDB(blk);
+    return true;
+  }
+  async restoreBlock(index) {
+    const blk = this.chain[index];
+    const snap = this.originalSnapshot[index];
+    if (!blk || !snap) return false;
+    blk.timestamp = snap.timestamp;
+    blk.username = snap.username;
+    blk.data = JSON.parse(JSON.stringify(snap.data));
+    blk.previousHash = snap.previousHash;
+    blk.hash = snap.hash;
+    await addBlockToDB(blk);
+    return true;
+  }
+  async restoreAllBlocks() {
+    let restoredCount = 0;
+    for (let i = 0; i < this.chain.length; i++) {
+      const blk = this.chain[i];
+      const actual = await blk.calculateHash();
+      const prevMismatch = i > 0 && blk.previousHash !== this.chain[i - 1].hash;
+      if (blk.hash !== actual || prevMismatch) {
+        if (this.originalSnapshot[i]) {
+          await this.restoreBlock(i);
+          restoredCount++;
+        } else {
+          // Fallback apabila dimanipulasi di luar aplikasi tanpa snapshot
+          if (i > 0) blk.previousHash = this.chain[i - 1].hash;
+          blk.hash = await blk.calculateHash();
+          this._backupValidBlock(blk);
+          await addBlockToDB(blk);
+          restoredCount++;
+        }
+      }
+    }
+    return restoredCount;
+  }
   async load() {
     const recs = await getAllBlocksFromDB();
     this.chain = [];
-    for (const r of recs) this.chain.push(await Block.fromRecord(r));
+    for (const r of recs) {
+      const b = await Block.fromRecord(r);
+      this.chain.push(b);
+      if (b.hash === await b.calculateHash()) {
+        this._backupValidBlock(b);
+      }
+    }
     if (!this.chain.length) {
+      this.clearBackupStorage();
       const g = await this.createGenesisBlock();
       this.chain.push(g);
+      this._backupValidBlock(g);
       await addBlockToDB(g);
     }
   }
 }
 
 const ledger = new Blockchain();
+let isTamperLockdown = false;
+let tamperStartBlock = null;
 
-/** Catat aksi sukses ke blockchain dengan identitas pelaku. */
+async function assertLedgerIntegrity() {
+  const res = await ledger.isChainValid();
+  if (!res.valid) {
+    await renderChain();
+    throw new Error(
+      `PERTAHANAN AKTIF [TAMPER LOCKDOWN]: Integritas Blockchain rusak mulai Blok #${res.at}! Operasi brankas dibekukan sampai data asli dipulihkan.`
+    );
+  }
+}
+
+function syncLockdownUI(res) {
+  isTamperLockdown = !res.valid;
+  tamperStartBlock = res.valid ? null : res.at;
+  const banner = $('lockdownBanner');
+  const tabLedger = $('tabBtnLedger');
+  if (banner) {
+    banner.classList.toggle('hidden', res.valid);
+    if (!res.valid && $('lockdownText')) {
+      $('lockdownText').textContent =
+        `Manipulasi database terdeteksi mulai Blok #${res.at}! Seluruh operasi Enkripsi, Dekripsi, Simpan, dan Steganografi dibekukan sementara.`;
+    }
+  }
+  if (tabLedger) {
+    tabLedger.classList.toggle('alert-tab', !res.valid);
+    tabLedger.textContent = res.valid ? 'Audit & Database' : `Audit & Database [LOCKDOWN #${res.at}]`;
+  }
+}
+
 async function logAction(action, detail, actor = null) {
-  const user = actor || currentActiveUser || $('userSelect')?.value || 'SYSTEM';
+  const user = actor || currentActiveUser || (selectedUser && selectedUser.username) || 'SYSTEM';
+  // Jika rantai sedang dalam mode simulasi manipulasi, jangan timpa blok di atas rantai yang rusak
+  const check = await ledger.isChainValid();
+  if (!check.valid) {
+    if (loggedIn) await renderChain();
+    return;
+  }
   await ledger.addBlock(new Block(ledger.chain.length, new Date().toISOString(), user, { action, detail }));
-  renderChain();
+  if (loggedIn) await renderChain();
 }
 
 // ══ UTIL UI ══════════════════════════════════════════════════════════════════
@@ -88,39 +221,117 @@ function toast(msg, isErr = false) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove('show'), 3400);
 }
-function setStatus(id, msg, kind = '') { const e = $(id); if (!e) return; e.textContent = msg; e.className = 'status ' + kind; }
+
+function setStatus(id, msg, kind = '') {
+  const e = $(id);
+  if (!e) return;
+  e.textContent = msg;
+  e.className = 'status' + (kind ? ' ' + kind : '');
+}
+
 const fmtBytes = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(2) + ' MB';
+
 async function guard(btn, fn) {
   btn.disabled = true;
-  try { await fn(); } catch (e) { toast(e.message || String(e), true); console.error(e); } finally { btn.disabled = false; }
+  try {
+    await fn();
+  } catch (e) {
+    toast(e.message || String(e), true);
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
-// ══ TAB NAV & SESSION ════════════════════════════════════════════════════════
+// ══ SANITASI MEMORI & WORKSPACE ══════════════════════════════════════════════
+let lastCipher = null;
+let selectedFile = null;
+let fileResult = null;
+let stegoDataUrl = null;
+let stegoBlobOut = null;
+let coverNormalizedBlobOut = null;
+
+/** Membersihkan seluruh input, output, dan jejak kriptografi di layar saat berganti sesi. */
+function clearWorkspaceState() {
+  lastCipher = null;
+  selectedFile = null;
+  fileResult = null;
+  stegoDataUrl = null;
+  stegoBlobOut = null;
+  coverNormalizedBlobOut = null;
+
+  // Bersihkan editor teks
+  $('noteTitle').value = '';
+  $('textInput').value = '';
+  $('vigKey').value = '';
+  $('aesKey').value = '';
+  $('textLayer1').value = '';
+  $('textOutput').value = '';
+  $('textSteps').innerHTML = '<span class="muted">Jalankan proses enkripsi atau dekripsi untuk menampilkan rincian perhitungan matematis.</span>';
+  $('vaultTextList').innerHTML = '';
+
+  // Bersihkan berkas RC4
+  $('fileInput').value = '';
+  $('fileKey').value = '';
+  setStatus('fileInfo', 'Belum ada berkas dipilih');
+  $('fileResult').classList.add('hidden');
+  $('btnFileDownload').classList.add('hidden');
+  $('fileSteps').innerHTML = '<span class="muted">Jalankan enkripsi atau dekripsi berkas untuk melihat permutasi S-Box dan tabel XOR byte.</span>';
+  $('vaultFileList').innerHTML = '';
+
+  // Bersihkan steganografi
+  $('coverFile').value = '';
+  $('coverImg').src = '';
+  $('coverImg').classList.add('hidden');
+  setStatus('coverInfo', 'Pilih citra sampul untuk menghitung kapasitas byte');
+  $('stegoMsg').value = '';
+  $('stegoOut').src = '';
+  $('stegoOut').classList.add('hidden');
+  $('btnStegoDownload').classList.add('hidden');
+  $('btnCoverNormalizedDownload').classList.add('hidden');
+  $('stegoSizeStatus').classList.add('hidden');
+  $('stegoFile').value = '';
+  $('stegoIn').src = '';
+  $('stegoIn').classList.add('hidden');
+  $('stegoExtracted').value = '';
+  $('stegoSteps').innerHTML = '<span class="muted">Sisipkan pesan pada citra untuk melihat perubahan bit LSB pada 2 piksel pertama.</span>';
+}
+
 function showTab(name) {
-  if (!loggedIn && name !== 'login') { toast('Login terlebih dahulu di Gatekeeper.', true); return; }
+  if (!loggedIn) return;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
   document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
-  if (name === 'ledger') { renderChain(); renderDb(); }
   if (name === 'text') renderVaultText();
   if (name === 'file') renderVaultFiles();
-  if (name !== 'login') stopFaceScan();
+  if (name === 'ledger') { renderChain(); renderDb(); }
 }
 
-function setSession(state, username = null) {
+function setSession(state, username = null, usbActive = false) {
   loggedIn = state;
   currentActiveUser = state ? username : null;
-  $('sessionBadge').textContent = state ? '🟢 TERBUKA' : 'TERKUNCI';
-  $('sessionBadge').className = 'badge ' + (state ? 'ok' : 'bad');
-  $('userBadge').textContent = state ? `👤 User: ${username}` : '👤 —';
-  $('userBadge').classList.toggle('hidden', !state);
-  $('btnLogout').classList.toggle('hidden', !state);
-  document.querySelectorAll('.tab').forEach(t => { if (t.dataset.tab !== 'login') t.classList.toggle('locked', !state); });
+  clearWorkspaceState();
+
+  $('gatekeeperView').classList.toggle('hidden', state);
+  $('workspaceView').classList.toggle('hidden', !state);
+
+  if (state) {
+    $('userBadge').textContent = `Akun: ${username}`;
+    $('usbWatchBadge').classList.toggle('hidden', !usbActive);
+    showTab('text');
+  } else {
+    $('userBadge').textContent = '—';
+    $('usbWatchBadge').classList.add('hidden');
+  }
 }
 
-// ══ TAB 1: GATEKEEPER & MULTI-USER AUTH ══════════════════════════════════════
+// ══ GATEKEEPER : DONGLE-FIRST 3-FACTOR AUTHENTICATION ════════════════════════
 let selectedUser = null;
-let dongleOk = false, faceOk = false, faceMode = 'asli', dongleModeUsed = 'usb';
-let activeUsbHandle = null, activeUsbContent = null;
+let dongleOk = false;
+let faceOk = false;
+let faceMode = 'biometrik';
+let dongleModeUsed = 'usb';
+let activeUsbHandle = null;
+let activeUsbContent = null;
 let regFaceDesc = null;
 
 function getDongleMode() {
@@ -128,198 +339,250 @@ function getDongleMode() {
   return checked ? checked.value : 'usb';
 }
 
-function updateLoginHint() {
-  if (!selectedUser) {
-    setStatus('loginStatus', 'Pilih atau daftarkan akun terlebih dahulu');
-    return;
+function updateGatekeeperProgress() {
+  // Identitas banner
+  const banner = $('detectedIdentityBar');
+  const dot = $('identityDot');
+  if (dongleOk && selectedUser) {
+    banner.classList.add('verified');
+    dot.classList.add('ok');
+    $('identityText').textContent = `Akun "${selectedUser.username}" · Seri Kunci ${selectedUser.dongleSerial}`;
+    $('btnResetAuth').classList.remove('hidden');
+  } else {
+    banner.classList.remove('verified');
+    dot.classList.remove('ok');
+    $('identityText').textContent = 'Belum ada kunci fisik yang terhubung';
+    $('btnResetAuth').classList.add('hidden');
   }
-  if (dongleOk && faceOk) setStatus('loginStatus', `Faktor ① & ② lolos untuk "${selectedUser.username}". Masukkan PIN.`, 'ok');
-  else setStatus('loginStatus', 'Selesaikan faktor ① (Dongle) dan ② (Wajah) lebih dulu');
+
+  // Tahap 1
+  $('cardFactor1').classList.toggle('done', dongleOk);
+  $('badgeFactor1').textContent = dongleOk ? 'Terverifikasi' : 'Menunggu';
+  $('badgeFactor1').className = 'factor-badge' + (dongleOk ? ' ok' : '');
+
+  // Tahap 2
+  $('btnFace').disabled = !dongleOk;
+  $('cardFactor2').classList.toggle('done', faceOk);
+  $('badgeFactor2').textContent = faceOk ? 'Terverifikasi' : (dongleOk ? 'Siap' : 'Menunggu');
+  $('badgeFactor2').className = 'factor-badge' + (faceOk ? ' ok' : '');
+
+  // Tahap 3
+  const readyPin = dongleOk && faceOk;
+  $('loginPin').disabled = !readyPin;
+  $('btnLogin').disabled = !readyPin;
+  $('badgeFactor3').textContent = readyPin ? 'Siap' : 'Menunggu';
+  if (readyPin && selectedUser) {
+    setStatus('loginStatus', `Tahap 01 & 02 selesai untuk "${selectedUser.username}". Masukkan PIN brankas.`, 'ok');
+  } else {
+    setStatus('loginStatus', 'Menunggu Tahap 01 dan 02 selesai');
+  }
 }
 
-function resetFactorStates() {
+function resetGatekeeperState() {
   stopUsbWatcher();
   stopFaceScan();
+  selectedUser = null;
   dongleOk = false;
   faceOk = false;
   activeUsbHandle = null;
   activeUsbContent = null;
   $('dongleFile').value = '';
+  $('dongleFileLabel').textContent = 'Pilih File Kunci (.key)';
+  $('loginPin').value = '';
   $('faceDist').textContent = '';
-  if (!selectedUser) {
-    $('userInfo').textContent = 'Belum ada akun dipilih. Klik "Daftar User Baru" untuk membuat akun.';
-    $('dongleNameHint').textContent = 'dongle-<user>.key';
-    setStatus('dongleStatus', 'Pilih akun terlebih dahulu');
-    setStatus('faceStatus', 'Pilih akun terlebih dahulu');
-  } else {
-    const hasFace = Array.isArray(selectedUser.faceDescriptor) && selectedUser.faceDescriptor.length === 128;
-    $('userInfo').textContent = `Serial Dongle terdaftar: ${selectedUser.dongleSerial} · Biometrik Wajah: ${hasFace ? '128-d Vector Tersimpan' : 'Tidak ada (gunakan mode simulasi)'}`;
-    $('dongleNameHint').textContent = dongleFileName(selectedUser.username);
-    setStatus('dongleStatus', `Menunggu verifikasi ${dongleFileName(selectedUser.username)}`);
-    setStatus('faceStatus', hasFace ? `Siap memverifikasi wajah "${selectedUser.username}".` : 'User ini didaftarkan tanpa wajah — centang Mode Simulasi.');
-  }
-  updateLoginHint();
+  const ctx = $('faceCanvas').getContext('2d');
+  ctx.clearRect(0, 0, $('faceCanvas').width, $('faceCanvas').height);
+  setStatus('dongleStatus', 'Hubungkan USB atau pilih file .key');
+  setStatus('faceStatus', 'Selesaikan Tahap 01 terlebih dahulu');
+  updateGatekeeperProgress();
 }
 
-async function refreshUserList(preferUsername = null) {
-  const users = await getAllUsers();
-  const sel = $('userSelect');
-  if (!users.length) {
-    sel.innerHTML = '<option value="">— Belum ada user terdaftar —</option>';
-    selectedUser = null;
-    resetFactorStates();
-    return;
+function applyVerifiedDongle(r, mode) {
+  dongleOk = true;
+  faceOk = false;
+  selectedUser = r.user;
+  dongleModeUsed = mode;
+  $('faceDist').textContent = '';
+
+  const hasFace = Array.isArray(selectedUser.faceDescriptor) && selectedUser.faceDescriptor.length === 128;
+  if (!hasFace) {
+    $('faceSim').checked = true;
   }
-  sel.innerHTML = users.map(u => `<option value="${esc(u.username)}">👤 ${esc(u.username)} (${esc(u.dongleSerial)})</option>`).join('');
-  const target = preferUsername && users.some(u => u.username === preferUsername) ? preferUsername : users[0].username;
-  sel.value = target;
-  selectedUser = await getUser(target);
-  resetFactorStates();
+  setStatus(
+    'faceStatus',
+    hasFace
+      ? `Kunci milik "${selectedUser.username}" dikenali. Menyiapkan kamera untuk verifikasi wajah...`
+      : `Akun "${selectedUser.username}" menggunakan mode simulasi wajah. Klik "Pindai Wajah".`
+  );
+  updateGatekeeperProgress();
+
+  // Panaskan kamera & model AI lebih awal begitu Tahap 01 lolos agar Tahap 02 tidak ada delay
+  preloadFaceModels();
+  if (hasFace && !$('faceSim').checked) {
+    _startCamera($('faceVideo')).then(() => {
+      setStatus('faceStatus', `Kamera siap untuk "${selectedUser.username}". Klik "Pindai Wajah".`);
+    }).catch(() => { /* jika belum diizinkan, akan diminta saat klik Pindai Wajah */ });
+  }
 }
 
-/** Callback otomatis saat USB flashdrive dicabut (Hardware Removal Policy). */
+/** Callback otomatis saat USB flashdrive dicabut pada tengah sesi. */
 async function handleUsbEject(reason) {
   const who = currentActiveUser || (selectedUser && selectedUser.username) || 'USER';
-  dongleOk = false;
-  activeUsbHandle = null;
-  activeUsbContent = null;
-  if (loggedIn) {
+  const wasLoggedIn = loggedIn;
+  if (wasLoggedIn) {
     await logAction('AUTO_LOCK_USB_EJECT', reason, who);
     setSession(false);
-    showTab('login');
   }
-  resetFactorStates();
+  resetGatekeeperState();
   const alertEl = $('lockAlert');
-  alertEl.textContent = `🚨 HARDWARE TOKEN TERPUTUS (${who}): ${reason} — Sesi dikunci otomatis!`;
+  alertEl.textContent = `Peringatan Keamanan (${who}): ${reason} Brankas telah dikunci secara otomatis.`;
   alertEl.classList.remove('hidden');
-  toast('USB Dongle terputus! Sesi dikunci otomatis.', true);
+  toast('Kunci USB terputus — brankas dikunci otomatis.', true);
 }
 
 function bindLogin() {
-  $('userSelect').onchange = async () => {
+  $('btnResetAuth').onclick = () => {
     $('lockAlert').classList.add('hidden');
-    const uname = $('userSelect').value;
-    selectedUser = uname ? await getUser(uname) : null;
-    resetFactorStates();
+    resetGatekeeperState();
   };
 
-  // Switch mode dongle: USB Flashdrive vs Upload manual
+  // Pilihan mode Kunci Fisik (USB vs Upload)
   document.querySelectorAll('input[name="dongleMode"]').forEach(r => {
     r.onchange = () => {
       const m = getDongleMode();
       $('dongleUsbBox').classList.toggle('hidden', m !== 'usb');
       $('dongleUploadBox').classList.toggle('hidden', m !== 'upload');
-      stopUsbWatcher();
-      dongleOk = false;
-      activeUsbHandle = null;
-      activeUsbContent = null;
-      $('dongleFile').value = '';
-      if (selectedUser) setStatus('dongleStatus', `Menunggu verifikasi ${dongleFileName(selectedUser.username)}`);
-      updateLoginHint();
+      resetGatekeeperState();
     };
   });
 
-  // Mode 1: Real USB Flashdrive Detection
+  // Tahap 1A: Hubungkan Drive USB Fisik (Dongle-First)
   $('btnUsbConnect').onclick = () => guard($('btnUsbConnect'), async () => {
     $('lockAlert').classList.add('hidden');
-    if (!selectedUser) throw new Error('Pilih atau daftarkan akun terlebih dahulu.');
-    const r = await connectUsbDrive(selectedUser.username);
-    dongleOk = r.valid;
-    if (r.valid) {
-      dongleModeUsed = 'usb';
-      activeUsbHandle = r.fileHandle;
-      activeUsbContent = r.content;
-      setStatus('dongleStatus', `✔ USB "${r.driveName}" terhubung · ${r.serial} (Auto-Lock aktif)`, 'ok');
-      startUsbWatcher(r.fileHandle, r.content, handleUsbEject);
-    } else {
-      setStatus('dongleStatus', `✖ ${r.reason}`, 'err');
-    }
-    updateLoginHint();
-  });
-
-  // Mode 2: Upload File Manual
-  $('dongleFile').onchange = async (e) => {
-    $('lockAlert').classList.add('hidden');
-    if (!selectedUser) {
-      setStatus('dongleStatus', '✖ Pilih akun terlebih dahulu.', 'err');
+    const r = await connectUsbDrive();
+    if (!r.valid) {
+      resetGatekeeperState();
+      setStatus('dongleStatus', r.reason, 'err');
       return;
     }
-    const r = await checkDongleFile(e.target.files[0], selectedUser.username);
-    dongleOk = r.valid;
-    if (r.valid) dongleModeUsed = 'upload';
-    setStatus('dongleStatus', r.valid ? `✔ ${r.reason} (${r.serial}, mode upload)` : `✖ ${r.reason}`, r.valid ? 'ok' : 'err');
-    updateLoginHint();
+    activeUsbHandle = r.fileHandle;
+    activeUsbContent = r.content;
+    setStatus('dongleStatus', `Drive "${r.driveName}" terhubung · Akun "${r.username}" (${r.serial})`, 'ok');
+    applyVerifiedDongle(r, 'usb');
+    startUsbWatcher(r.fileHandle, r.content, handleUsbEject);
+  });
+
+  // Tahap 1B: Unggah File .key Manual (Dongle-First)
+  $('dongleFile').onchange = async (e) => {
+    $('lockAlert').classList.add('hidden');
+    const file = e.target.files[0];
+    if (!file) return;
+    $('dongleFileLabel').textContent = file.name;
+    const r = await checkDongleFile(file);
+    if (!r.valid) {
+      resetGatekeeperState();
+      setStatus('dongleStatus', r.reason, 'err');
+      return;
+    }
+    setStatus('dongleStatus', `File kunci valid · Akun "${r.username}" (${r.serial})`, 'ok');
+    applyVerifiedDongle(r, 'upload');
   };
 
-  // Faktor 2: Biometrik Wajah
+  // Tahap 2: Verifikasi Wajah
   const faceMsg = m => setStatus('faceStatus', m);
   const faceFail = (e) => {
-    stopFaceScan();
-    setStatus('faceStatus', '✖ ' + (e.message || e) + ' — jika perangkat bermasalah, aktifkan mode simulasi.', 'err');
+    cancelFaceScanLoop();
+    setStatus('faceStatus', (e.message || e) + ' — centang simulasi apabila perangkat tanpa kamera.', 'err');
     throw e;
   };
 
   $('btnFace').onclick = () => guard($('btnFace'), async () => {
-    if (!selectedUser) throw new Error('Pilih akun terlebih dahulu.');
+    if (!dongleOk || !selectedUser) throw new Error('Hubungkan kunci fisik pada Tahap 01 terlebih dahulu.');
     faceOk = false;
     $('faceDist').textContent = '';
     if ($('faceSim').checked) {
       await initFaceScan($('faceVideo'), $('faceCanvas'), faceMsg);
       faceOk = true;
       faceMode = 'simulasi';
-      setStatus('faceStatus', `⚠ Lolos via MODE SIMULASI untuk "${selectedUser.username}".`, 'ok');
+      setStatus('faceStatus', `Verifikasi simulasi selesai untuk "${selectedUser.username}".`, 'ok');
     } else {
       try {
         const r = await verifyUserFace($('faceVideo'), $('faceCanvas'), selectedUser.faceDescriptor, faceMsg);
-        $('faceDist').textContent = `Jarak Euclidean = ${r.distance.toFixed(4)} (batas ≤ ${FACE_MATCH_THRESHOLD}) · kemiripan ${r.similarity.toFixed(1)}%`;
-        if (!r.ok) throw new Error(`Wajah tidak cocok dengan "${selectedUser.username}" (jarak ${r.distance.toFixed(3)} > ${FACE_MATCH_THRESHOLD}).`);
+        $('faceDist').textContent = `Jarak Euclidean: ${r.distance.toFixed(4)} (batas <= ${FACE_MATCH_THRESHOLD}) · Kemiripan: ${r.similarity.toFixed(1)}%`;
+        if (!r.ok) {
+          throw new Error(`Wajah tidak cocok dengan pemilik kunci "${selectedUser.username}" (d=${r.distance.toFixed(3)}).`);
+        }
         faceOk = true;
-        faceMode = 'asli';
-        setStatus('faceStatus', `✔ Wajah cocok dengan "${selectedUser.username}" (biometrik asli).`, 'ok');
-      } catch (e) { faceFail(e); }
+        faceMode = 'biometrik';
+        setStatus('faceStatus', `Wajah cocok dengan pemilik kunci "${selectedUser.username}".`, 'ok');
+      } catch (e) {
+        faceFail(e);
+      }
     }
-    updateLoginHint();
+    updateGatekeeperProgress();
+    if (faceOk) $('loginPin').focus();
   });
-  $('faceSim').onchange = () => { faceOk = false; updateLoginHint(); };
 
-  // Faktor 3: Master PIN & Login
-  $('btnLogin').onclick = () => guard($('btnLogin'), async () => {
-    if (!selectedUser) throw new Error('Pilih akun terlebih dahulu.');
-    if (!dongleOk) throw new Error('Faktor ① (Dongle) belum terverifikasi.');
-    if (!faceOk) throw new Error('Faktor ② (Biometrik Wajah) belum terverifikasi.');
-    const pinHash = await hashSHA256($('loginPin').value);
-    if (pinHash !== selectedUser.pinHash) throw new Error('Master PIN salah.');
+  $('faceSim').onchange = () => {
+    faceOk = false;
+    updateGatekeeperProgress();
+  };
+
+  // Tahap 3: Verifikasi PIN & Buka Brankas
+  const executeLogin = () => guard($('btnLogin'), async () => {
+    if (!selectedUser || !dongleOk) throw new Error('Kunci fisik belum terverifikasi.');
+    if (!faceOk) throw new Error('Verifikasi wajah belum selesai.');
+    const pin = $('loginPin').value;
+    if (!pin) throw new Error('Masukkan PIN brankas.');
+    const pinHash = await hashSHA256(pin);
+    if (pinHash !== selectedUser.pinHash) {
+      throw new Error('PIN brankas tidak sesuai.');
+    }
+
+    const uname = selectedUser.username;
+    const usbActive = dongleModeUsed === 'usb' && !!activeUsbHandle;
     $('loginPin').value = '';
     $('lockAlert').classList.add('hidden');
     stopFaceScan();
-    setSession(true, selectedUser.username);
-    if (dongleModeUsed === 'usb' && activeUsbHandle) {
+
+    setSession(true, uname, usbActive);
+    if (usbActive) {
       startUsbWatcher(activeUsbHandle, activeUsbContent, handleUsbEject);
     }
-    await logAction('LOGIN', `Login 3 faktor berhasil (dongle: ${dongleModeUsed}, wajah: ${faceMode})`, selectedUser.username);
-    toast(`Selamat datang, ${selectedUser.username}!`);
-    showTab('text');
+    await logAction('LOGIN', `Brankas dibuka (kunci: ${dongleModeUsed}, wajah: ${faceMode})`, uname);
+    toast(`Brankas "${uname}" berhasil dibuka.`);
+  });
+
+  $('btnLogin').onclick = executeLogin;
+  $('loginPin').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !$('btnLogin').disabled) executeLogin();
   });
 
   $('btnLogout').onclick = async () => {
     const who = currentActiveUser;
     stopUsbWatcher();
     setSession(false);
-    resetFactorStates();
-    if (who) await logAction('LOGOUT', 'User logout manual', who);
-    showTab('login');
+    resetGatekeeperState();
+    if (who) await logAction('LOGOUT', 'Brankas dikunci oleh pengguna', who);
+    toast('Brankas telah dikunci.');
   };
 
-  // ── Modal Registrasi User Baru ──
+  // ── Modal Pendaftaran Brankas Baru ─────────────────────────────────────────
   const openRegModal = () => {
     regFaceDesc = null;
     $('regUser').value = '';
     $('regPin').value = '';
     $('regPin2').value = '';
     $('regFaceSkip').checked = false;
-    setStatus('regFaceStatus', 'Belum direkam');
+    setStatus('regFaceStatus', 'Menyiapkan kamera...');
     $('regStatus').classList.add('hidden');
     $('regModal').classList.remove('hidden');
+    preloadFaceModels();
+    _startCamera($('regVideo')).then(() => {
+      setStatus('regFaceStatus', 'Kamera aktif — posisikan wajah lalu klik "Rekam Sampel Wajah".');
+    }).catch(() => {
+      setStatus('regFaceStatus', 'Klik "Rekam Sampel Wajah" untuk mengizinkan akses kamera.');
+    });
   };
   const closeRegModal = () => {
     stopFaceScan();
@@ -330,18 +593,22 @@ function bindLogin() {
   $('btnRegClose').onclick = closeRegModal;
 
   $('btnRegFace').onclick = () => guard($('btnRegFace'), async () => {
-    if ($('regFaceSkip').checked) throw new Error('Hapus centang "Lewati wajah" untuk merekam wajah.');
+    if ($('regFaceSkip').checked) {
+      throw new Error('Hilangkan centang lewati perekaman terlebih dahulu.');
+    }
     try {
       const desc = await scanFaceDescriptor($('regVideo'), $('regCanvas'), m => setStatus('regFaceStatus', m), {
-        samples: 5, timeoutMs: 25000, verb: 'Merekam'
+        samples: 3,
+        timeoutMs: 20000,
+        verb: 'Merekam',
       });
       regFaceDesc = Array.from(desc);
-      stopFaceScan();
+      cancelFaceScanLoop();
       const norm = Math.sqrt(regFaceDesc.reduce((s, v) => s + v * v, 0)).toFixed(3);
-      setStatus('regFaceStatus', `✔ Wajah terekam (128-d vector, norm=${norm})`, 'ok');
+      setStatus('regFaceStatus', `Vektor wajah 128-d berhasil direkam (norm=${norm}).`, 'ok');
     } catch (e) {
-      stopFaceScan();
-      setStatus('regFaceStatus', '✖ ' + (e.message || e), 'err');
+      cancelFaceScanLoop();
+      setStatus('regFaceStatus', e.message || String(e), 'err');
       throw e;
     }
   });
@@ -349,14 +616,16 @@ function bindLogin() {
   $('btnRegSubmit').onclick = () => guard($('btnRegSubmit'), async () => {
     const username = $('regUser').value.trim().toLowerCase();
     if (!/^[a-z0-9_-]{3,20}$/.test(username)) {
-      throw new Error('Username harus 3–20 karakter (huruf kecil a-z, angka, _ atau -).');
+      throw new Error('Nama pengguna harus 3–20 karakter (huruf kecil a–z, angka, _ atau -).');
     }
-    if (await getUser(username)) throw new Error(`Username "${username}" sudah digunakan.`);
+    if (await getUser(username)) {
+      throw new Error(`Nama pengguna "${username}" sudah terdaftar.`);
+    }
     const pin = $('regPin').value;
-    if (pin.length < 4) throw new Error('Master PIN minimal 4 karakter.');
+    if (pin.length < 4) throw new Error('PIN brankas minimal 4 karakter.');
     if (pin !== $('regPin2').value) throw new Error('Konfirmasi PIN tidak cocok.');
     if (!regFaceDesc && !$('regFaceSkip').checked) {
-      throw new Error('Rekam wajah terlebih dahulu, atau centang "Lewati wajah".');
+      throw new Error('Rekam sampel wajah terlebih dahulu, atau centang opsi lewati perekaman.');
     }
 
     const dongle = await generateDongle(username);
@@ -365,11 +634,10 @@ function bindLogin() {
     if (saveMode === 'usb') {
       try {
         const driveName = await writeDongleToUsb(dongle);
-        dongleNote = `ditulis langsung ke USB "${driveName}/${dongle.fileName}"`;
-      } catch (e) {
-        // Fallback otomatis ke download bila penulisan ke USB gagal/dibatalkan
+        dongleNote = `ditulis ke drive USB "${driveName}/${dongle.fileName}"`;
+      } catch {
         downloadBlob(dongle.blob, dongle.fileName);
-        dongleNote = `fallback download ${dongle.fileName} (${e.message})`;
+        dongleNote = `diunduh sebagai ${dongle.fileName}`;
       }
     } else {
       downloadBlob(dongle.blob, dongle.fileName);
@@ -383,78 +651,151 @@ function bindLogin() {
       createdAt: new Date().toISOString(),
     };
     await registerUser(userRecord);
-    await logAction('USER_REGISTER', `User "${username}" terdaftar · dongle ${dongle.serial} (${dongleNote}) · wajah: ${regFaceDesc ? '128-d' : 'dilewati'}`, username);
+    await logAction(
+      'USER_REGISTER',
+      `Brankas "${username}" dibuat · seri kunci ${dongle.serial} (${dongleNote})`,
+      username
+    );
     closeRegModal();
-    await refreshUserList(username);
-    toast(`User "${username}" terdaftar (${dongleNote}).`);
+    toast(`Brankas "${username}" berhasil dibuat (${dongleNote}). Hubungkan kunci tersebut pada Tahap 01.`);
   });
 }
 
-// ══ TAB 2: SUPER-ENCRYPTION (Vigenère Klasik A-Z Mod 26 + AES-256-GCM) ══════
-let lastCipher = null;
+// ══ PANEL 1: SUPER-ENCRYPTION (Vigenère Mod 26 + AES-256-GCM AAD) ════════════
 function bindText() {
+  $('btnNewNote').onclick = () => {
+    lastCipher = null;
+    $('noteTitle').value = '';
+    $('textInput').value = '';
+    $('textLayer1').value = '';
+    $('textOutput').value = '';
+    $('textSteps').innerHTML = '<span class="muted">Editor telah dibersihkan.</span>';
+  };
+
+  $('btnCopyTextOut').onclick = async () => {
+    const val = $('textOutput').value;
+    if (!val) { toast('Tidak ada output untuk disalin.', true); return; }
+    await navigator.clipboard.writeText(val);
+    toast('Output berhasil disalin ke clipboard.');
+  };
+
   $('btnTextEnc').onclick = () => guard($('btnTextEnc'), async () => {
+    if (!currentActiveUser) throw new Error('Sesi brankas tidak aktif.');
+    await assertLedgerIntegrity();
     const text = $('textInput').value;
-    if (!text) throw new Error('Teks kosong.');
-    const r = await superEncryptTrace(text, $('vigKey').value, $('aesKey').value);
+    if (!text) throw new Error('Masukkan teks yang akan dienkripsi.');
+    const r = await superEncryptTrace(text, $('vigKey').value, $('aesKey').value, currentActiveUser);
     $('textLayer1').value = r.vigText;
     $('textOutput').value = r.aes.b64;
     lastCipher = r.aes.b64;
     $('textSteps').innerHTML = renderEncryptSteps(r, r.vigKey, $('aesKey').value);
-    await logAction('SUPER_ENCRYPT', `Teks ${text.length} char, SHA256(cipher)=${(await hashSHA256(r.aes.b64)).slice(0, 16)}…`);
-    toast('Enkripsi dua lapis berhasil.');
+    await logAction(
+      'SUPER_ENCRYPT',
+      `Enkripsi teks (${text.length} karakter, AAD=${currentActiveUser}), SHA256=${(await hashSHA256(r.aes.b64)).slice(0, 16)}…`
+    );
+    toast('Enkripsi dua lapis selesai.');
   });
+
   $('btnTextDec').onclick = () => guard($('btnTextDec'), async () => {
-    const r = await superDecryptTrace($('textInput').value, $('vigKey').value, $('aesKey').value);
+    if (!currentActiveUser) throw new Error('Sesi brankas tidak aktif.');
+    await assertLedgerIntegrity();
+    const r = await superDecryptTrace($('textInput').value, $('vigKey').value, $('aesKey').value, currentActiveUser);
     $('textLayer1').value = r.vigCipher;
     $('textOutput').value = r.plain;
     $('textSteps').innerHTML = renderDecryptSteps(r, r.vigKey);
-    toast('Dekripsi berhasil.');
+    toast('Dekripsi dua lapis berhasil.');
   });
+
   $('btnTextSave').onclick = () => guard($('btnTextSave'), async () => {
-    if (!currentActiveUser) throw new Error('Anda belum login.');
-    if (!lastCipher) throw new Error('Enkripsi teks terlebih dahulu.');
-    await saveVaultText({ username: currentActiveUser, ciphertext: lastCipher, createdAt: new Date().toISOString() });
+    if (!currentActiveUser) throw new Error('Sesi brankas tidak aktif.');
+    await assertLedgerIntegrity();
+    if (!lastCipher) throw new Error('Enkripsi catatan terlebih dahulu sebelum menyimpan ke brankas.');
+    const title = $('noteTitle').value.trim() || `Catatan #${new Date().toLocaleTimeString('id-ID')}`;
+    await saveVaultText({
+      username: currentActiveUser,
+      title,
+      ciphertext: lastCipher,
+      createdAt: new Date().toISOString(),
+    });
     await renderVaultText();
-    toast(`Disimpan ke vault milik "${currentActiveUser}".`);
-  });
-}
-async function renderVaultText() {
-  if (!currentActiveUser) { $('vaultTextList').innerHTML = '<span class="muted">Login terlebih dahulu</span>'; return; }
-  const items = await getVaultTextsByUser(currentActiveUser);
-  $('vaultTextList').innerHTML = items.length
-    ? items.map(i => `<div class="item"><span>#${i.id} · 👤 ${esc(i.username)} · ${esc(i.createdAt)} · ${esc(i.ciphertext.slice(0, 36))}…</span><button class="btn small" data-load="${i.id}">Muat</button></div>`).join('')
-    : `<span class="muted">Vault teks milik "${esc(currentActiveUser)}" masih kosong.</span>`;
-  $('vaultTextList').querySelectorAll('[data-load]').forEach(b => b.onclick = () => {
-    const it = items.find(x => x.id == b.dataset.load);
-    $('textInput').value = it.ciphertext;
-    toast('Ciphertext dimuat ke input. Isi kunci lalu klik Dekripsi.');
+    toast(`Catatan "${title}" disimpan ke brankas.`);
   });
 }
 
-// ══ TAB 3: FILE CRYPTO (RC4) ═════════════════════════════════════════════════
-let selectedFile = null, fileResult = null;
+async function renderVaultText() {
+  if (!currentActiveUser) return;
+  const items = await getVaultTextsByUser(currentActiveUser);
+  if (!items.length) {
+    $('vaultTextList').innerHTML = '<span class="muted small-text">Belum ada catatan tersimpan pada brankas ini.</span>';
+    return;
+  }
+  $('vaultTextList').innerHTML = items.map(i => `
+    <div class="vault-item">
+      <div class="vault-item-top">
+        <span class="vault-item-title">${esc(i.title || 'Catatan #' + i.id)}</span>
+        <span class="vault-item-meta">#${i.id}</span>
+      </div>
+      <div class="vault-item-meta">${esc(i.ciphertext.slice(0, 42))}…</div>
+      <div class="vault-item-meta">${esc(new Date(i.createdAt).toLocaleString('id-ID'))}</div>
+      <div class="vault-item-actions">
+        <button class="btn tiny" data-load="${i.id}">Muat ke Editor</button>
+        <button class="btn tiny danger" data-del="${i.id}">Hapus</button>
+      </div>
+    </div>
+  `).join('');
+
+  $('vaultTextList').querySelectorAll('[data-load]').forEach(b => {
+    b.onclick = () => {
+      const it = items.find(x => x.id == b.dataset.load);
+      if (!it) return;
+      $('noteTitle').value = it.title || '';
+      $('textInput').value = it.ciphertext;
+      $('textLayer1').value = '';
+      $('textOutput').value = '';
+      toast('Ciphertext dimuat ke kolom masukan. Isi kedua kunci lalu klik "Dekripsi ke Plaintext".');
+    };
+  });
+
+  $('vaultTextList').querySelectorAll('[data-del]').forEach(b => {
+    b.onclick = () => guard(b, async () => {
+      await assertLedgerIntegrity();
+      await deleteVaultText(Number(b.dataset.del), currentActiveUser);
+      renderVaultText();
+      toast('Catatan dihapus dari brankas.');
+    });
+  });
+}
+
+// ══ PANEL 2: ENKRIPSI BERKAS (RC4) ═══════════════════════════════════════════
 function pickFile(f) {
   selectedFile = f;
-  setStatus('fileInfo', f ? `${f.name} (${fmtBytes(f.size)})` : 'Belum ada file', f ? 'ok' : '');
+  setStatus('fileInfo', f ? `${f.name} (${fmtBytes(f.size)})` : 'Belum ada berkas dipilih', f ? 'ok' : '');
 }
+
 function bindFile() {
   const dz = $('dropzone');
   dz.onclick = () => $('fileInput').click();
   $('fileInput').onchange = e => pickFile(e.target.files[0]);
   dz.ondragover = e => { e.preventDefault(); dz.classList.add('over'); };
   dz.ondragleave = () => dz.classList.remove('over');
-  dz.ondrop = e => { e.preventDefault(); dz.classList.remove('over'); pickFile(e.dataTransfer.files[0]); };
+  dz.ondrop = e => {
+    e.preventDefault();
+    dz.classList.remove('over');
+    pickFile(e.dataTransfer.files[0]);
+  };
 
   const showResult = (blob, name, msg) => {
     fileResult = { blob, name };
     $('btnFileDownload').classList.remove('hidden');
+    $('fileResult').classList.remove('hidden');
     setStatus('fileResult', msg, 'ok');
   };
+
   $('btnFileEnc').onclick = () => guard($('btnFileEnc'), async () => {
-    if (!currentActiveUser) throw new Error('Anda belum login.');
-    if (!selectedFile) throw new Error('Pilih file terlebih dahulu.');
-    if (!$('fileKey').value) throw new Error('Kunci RC4 kosong.');
+    if (!currentActiveUser) throw new Error('Sesi brankas tidak aktif.');
+    await assertLedgerIntegrity();
+    if (!selectedFile) throw new Error('Pilih berkas terlebih dahulu.');
+    if (!$('fileKey').value) throw new Error('Masukkan kunci RC4.');
     const { bytes: enc, trace } = await encryptFileRC4(selectedFile, $('fileKey').value);
     const hash = await hashSHA256(enc);
     await saveVaultFile({
@@ -465,132 +806,303 @@ function bindFile() {
       sha256: hash,
       data: enc.buffer,
     });
-    await logAction('FILE_ENCRYPT_RC4', `${selectedFile.name} (${fmtBytes(selectedFile.size)}), SHA256(enc)=${hash.slice(0, 16)}…`);
+    await logAction('FILE_ENCRYPT_RC4', `${selectedFile.name} (${fmtBytes(selectedFile.size)}), SHA256=${hash.slice(0, 16)}…`);
     $('fileSteps').innerHTML = renderRc4Steps(trace, true);
-    showResult(new Blob([enc], { type: 'application/octet-stream' }), selectedFile.name + '.enc', `Terenkripsi → ${selectedFile.name}.enc (${fmtBytes(enc.length)})`);
+    showResult(new Blob([enc], { type: 'application/octet-stream' }), selectedFile.name + '.enc', `Berkas terenkripsi: ${selectedFile.name}.enc (${fmtBytes(enc.length)})`);
     renderVaultFiles();
+    toast('Berkas dienkripsi dan disimpan ke brankas.');
   });
+
   $('btnFileDec').onclick = () => guard($('btnFileDec'), async () => {
-    if (!selectedFile) throw new Error('Pilih file .enc terlebih dahulu.');
-    if (!$('fileKey').value) throw new Error('Kunci RC4 kosong.');
+    await assertLedgerIntegrity();
+    if (!selectedFile) throw new Error('Pilih berkas .enc yang akan didekripsi.');
+    if (!$('fileKey').value) throw new Error('Masukkan kunci RC4.');
     const r = await decryptFileRC4(selectedFile, $('fileKey').value);
     $('fileSteps').innerHTML = renderRc4Steps(r.trace, false);
-    showResult(new Blob([r.data]), r.name, `Terdekripsi → ${r.name} (${fmtBytes(r.data.length)})`);
+    showResult(new Blob([r.data]), r.name, `Berkas dipulihkan: ${r.name} (${fmtBytes(r.data.length)})`);
+    toast(`Berkas "${r.name}" berhasil didekripsi.`);
   });
+
   $('btnFileDownload').onclick = () => fileResult && downloadBlob(fileResult.blob, fileResult.name);
 }
+
 async function renderVaultFiles() {
-  if (!currentActiveUser) { $('vaultFileList').innerHTML = '<span class="muted">Login terlebih dahulu</span>'; return; }
+  if (!currentActiveUser) return;
   const items = await getVaultFilesByUser(currentActiveUser);
-  $('vaultFileList').innerHTML = items.length
-    ? items.map(i => `<div class="item"><span>#${i.id} · 👤 ${esc(i.username)} · ${esc(i.originalName)}.enc · ${fmtBytes(i.size)}</span><span><button class="btn small" data-dl="${i.id}">Download</button> <button class="btn small danger" data-del="${i.id}">Hapus</button></span></div>`).join('')
-    : `<span class="muted">Vault file milik "${esc(currentActiveUser)}" masih kosong.</span>`;
-  $('vaultFileList').querySelectorAll('[data-dl]').forEach(b => b.onclick = () => {
-    const it = items.find(x => x.id == b.dataset.dl);
-    downloadBlob(new Blob([it.data]), it.originalName + '.enc');
+  if (!items.length) {
+    $('vaultFileList').innerHTML = '<span class="muted small-text">Belum ada berkas .enc pada brankas ini.</span>';
+    return;
+  }
+  $('vaultFileList').innerHTML = items.map(i => `
+    <div class="vault-item">
+      <div class="vault-item-top">
+        <span class="vault-item-title">${esc(i.originalName)}.enc</span>
+        <span class="vault-item-meta">${fmtBytes(i.size)}</span>
+      </div>
+      <div class="vault-item-meta">SHA256: ${esc((i.sha256 || '').slice(0, 20))}…</div>
+      <div class="vault-item-actions">
+        <button class="btn tiny" data-dl="${i.id}">Unduh .enc</button>
+        <button class="btn tiny danger" data-del="${i.id}">Hapus</button>
+      </div>
+    </div>
+  `).join('');
+
+  $('vaultFileList').querySelectorAll('[data-dl]').forEach(b => {
+    b.onclick = async () => {
+      const full = await getVaultFile(Number(b.dataset.dl));
+      if (!full) return;
+      downloadBlob(new Blob([full.data]), full.originalName + '.enc');
+    };
   });
-  $('vaultFileList').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
-    await deleteVaultFile(Number(b.dataset.del));
-    renderVaultFiles();
+
+  $('vaultFileList').querySelectorAll('[data-del]').forEach(b => {
+    b.onclick = () => guard(b, async () => {
+      await assertLedgerIntegrity();
+      await deleteVaultFile(Number(b.dataset.del));
+      renderVaultFiles();
+      toast('Berkas dihapus dari brankas.');
+    });
   });
 }
 
-// ══ TAB 4: STEGANOGRAFI ══════════════════════════════════════════════════════
-let stegoDataUrl = null;
+// ══ PANEL 3: STEGANOGRAFI CITRA (LSB) ════════════════════════════════════════
 function bindStego() {
   $('coverFile').onchange = async e => {
-    const f = e.target.files[0]; if (!f) return;
-    $('coverImg').src = (await loadImageFromFile(f)).src;
+    const f = e.target.files[0];
+    if (!f) return;
+    const img = await loadImageFromFile(f);
+    $('coverImg').src = img.src;
     $('coverImg').classList.remove('hidden');
-    $('coverImg').onload = () => setStatus('coverInfo', `${$('coverImg').naturalWidth}×${$('coverImg').naturalHeight} px — kapasitas ±${fmtBytes(stegoCapacity($('coverImg')))}`, 'ok');
+    $('coverImg')._fileSize = f.size;
+    $('coverImg')._fileType = f.type || '';
+    $('coverImg')._fileName = f.name || 'cover.png';
+    $('coverImg').onload = () => setStatus(
+      'coverInfo',
+      `${f.name} (${f.size.toLocaleString('id-ID')} byte) · Dimensi ${$('coverImg').naturalWidth}×${$('coverImg').naturalHeight} px · Kapasitas ${fmtBytes(stegoCapacity($('coverImg')))}`,
+      'ok'
+    );
   };
+
   $('btnEmbed').onclick = () => guard($('btnEmbed'), async () => {
-    if ($('coverImg').classList.contains('hidden')) throw new Error('Upload cover image dahulu.');
+    await assertLedgerIntegrity();
+    if ($('coverImg').classList.contains('hidden')) throw new Error('Pilih citra sampul terlebih dahulu.');
     const msg = $('stegoMsg').value;
-    if (!msg) throw new Error('Pesan kosong.');
-    const { dataUrl, trace } = embedLSBWithTrace($('coverImg'), msg);
+    if (!msg) throw new Error('Masukkan pesan rahasia yang akan disisipkan.');
+    const { dataUrl, stegoBlob, coverNormalizedBlob, trace } = await embedLSBWithTrace($('coverImg'), msg);
     stegoDataUrl = dataUrl;
+    stegoBlobOut = stegoBlob;
+    coverNormalizedBlobOut = coverNormalizedBlob;
+
     $('stegoSteps').innerHTML = renderStegoSteps(trace);
     $('stegoOut').src = stegoDataUrl;
     $('stegoOut').classList.remove('hidden');
     $('btnStegoDownload').classList.remove('hidden');
-    await logAction('STEGO_EMBED', `Pesan ${msg.length} char disisipkan, SHA256(msg)=${(await hashSHA256(msg)).slice(0, 16)}…`);
-    toast('Pesan berhasil disisipkan.');
+    $('btnCoverNormalizedDownload').classList.remove('hidden');
+    $('stegoSizeStatus').classList.remove('hidden');
+
+    const exactWithOrig = trace.isOrigPng && trace.origUploadBytes === trace.stegoFinalBytes;
+    const statusText = exactWithOrig
+      ? `Ukuran Stego-Image: ${trace.stegoFinalBytes.toLocaleString('id-ID')} byte — 100% IDENTIK (selisih 0 byte) dengan file PNG asli yang diunggah.`
+      : `Ukuran Stego-Image & Sampul PNG Terstandarisasi: ${trace.stegoFinalBytes.toLocaleString('id-ID')} byte (selisih 0 byte / identik).`;
+    setStatus('stegoSizeStatus', statusText, 'ok');
+
+    await logAction('STEGO_EMBED', `Pesan ${msg.length} karakter disisipkan ke LSB (${trace.stegoFinalBytes} byte, delta=${trace.sizeDiffBytes}B), SHA256=${(await hashSHA256(msg)).slice(0, 16)}…`);
+    toast('Pesan berhasil disisipkan dengan ukuran berkas teroptimasi.');
   });
+
   $('btnStegoDownload').onclick = () => {
-    const a = document.createElement('a'); a.href = stegoDataUrl; a.download = 'stego-image.png'; a.click();
+    if (stegoBlobOut) {
+      downloadBlob(stegoBlobOut, 'stego-image.png');
+    } else if (stegoDataUrl) {
+      const a = document.createElement('a');
+      a.href = stegoDataUrl;
+      a.download = 'stego-image.png';
+      a.click();
+    }
   };
+
+  $('btnCoverNormalizedDownload').onclick = () => {
+    if (coverNormalizedBlobOut) {
+      downloadBlob(coverNormalizedBlobOut, 'cover-reference.png');
+    }
+  };
+
   $('stegoFile').onchange = async e => {
-    const f = e.target.files[0]; if (!f) return;
+    const f = e.target.files[0];
+    if (!f) return;
     $('stegoIn').src = (await loadImageFromFile(f)).src;
     $('stegoIn').classList.remove('hidden');
   };
+
   $('btnExtract').onclick = () => guard($('btnExtract'), async () => {
-    if ($('stegoIn').classList.contains('hidden')) throw new Error('Upload stego image (.png) dahulu.');
+    await assertLedgerIntegrity();
+    if ($('stegoIn').classList.contains('hidden')) throw new Error('Pilih berkas Stego-Image (.png) terlebih dahulu.');
     $('stegoExtracted').value = extractLSB($('stegoIn'));
-    toast('Pesan diekstrak.');
+    toast('Pesan tersembunyi berhasil diekstrak.');
   });
 }
 
-// ══ TAB 5: LEDGER & DB INSPECTOR ═════════════════════════════════════════════
+// ══ PANEL 4: BLOCKCHAIN LEDGER & DATABASE INSPECTOR ══════════════════════════
 async function renderChain() {
   const res = await ledger.isChainValid();
+  syncLockdownUI(res);
+
   const badge = $('chainBadge');
-  badge.textContent = res.valid ? `✔ VALID · ${ledger.chain.length} blok` : `✖ TAMPERED (blok #${res.at})`;
+  badge.textContent = res.valid
+    ? `TERVERIFIKASI · ${ledger.chain.length} BLOK`
+    : `LOCKDOWN AKTIF · MANIPULASI MULAI BLOK #${res.at}`;
   badge.className = 'badge ' + (res.valid ? 'ok' : 'bad');
-  $('chainView').innerHTML = ledger.chain.map((b, i) => `
-    <div class="block ${!res.valid && i >= res.at ? 'bad' : ''}">
-      <b>Block #${b.index}</b> · 👤 <b>${esc(b.username)}</b> · ${esc(b.timestamp)}<br>
-      <b>Data:</b> ${esc(JSON.stringify(b.data))}<br>
-      <b>Prev:</b> <span class="hash">${esc(b.previousHash)}</span><br>
-      <b>Hash:</b> <span class="hash">${esc(b.hash)}</span>
-    </div>`).join('');
+
+  const cardsHtml = [];
+  for (let i = 0; i < ledger.chain.length; i++) {
+    const b = ledger.chain[i];
+    const actualHash = await b.calculateHash();
+    const isDirectTamper = actualHash !== b.hash;
+    const isDominoBreak = !isDirectTamper && !res.valid && i >= res.at;
+
+    const cardClass = isDirectTamper ? 'block bad' : (isDominoBreak ? 'block domino' : 'block');
+    let statusTag = '';
+    if (isDirectTamper) {
+      statusTag = `<span class="block-status-tag tampered">DATA BLOK DIMANIPULASI</span>`;
+    } else if (isDominoBreak) {
+      statusTag = `<span class="block-status-tag domino">EFEK DOMINO · RANTAI PUTUS DARI BLOK #${res.at}</span>`;
+    }
+
+    const restoreBtn = isDirectTamper
+      ? `<button class="btn primary tiny" data-restore-idx="${b.index}">Pulihkan Blok #${b.index}</button>`
+      : '';
+
+    const hashComparison = isDirectTamper
+      ? `<div><b>Hash Tersimpan:</b> <span class="hash">${esc(b.hash)}</span></div>
+         <div><b>Hash Hitung Ulang:</b> <span class="hash mismatch">${esc(actualHash)} (TIDAK COCOK!)</span></div>`
+      : `<div><b>Hash:</b> <span class="hash">${esc(b.hash)}</span></div>`;
+
+    cardsHtml.push(`
+      <div class="${cardClass}">
+        <div class="block-head">
+          <span>BLOK #${b.index} · ${esc(b.username)}</span>
+          <div class="row">
+            ${restoreBtn}
+            <button class="btn ghost tiny" data-tamper-idx="${b.index}">Ubah Data Blok #${b.index}</button>
+          </div>
+        </div>
+        ${statusTag ? `<div>${statusTag}</div>` : ''}
+        <div class="mono-meta">${esc(new Date(b.timestamp).toLocaleString('id-ID'))}</div>
+        <div><b>Data:</b> <code>${esc(JSON.stringify(b.data))}</code></div>
+        <div><b>Prev:</b> <span class="hash">${esc(b.previousHash)}</span></div>
+        ${hashComparison}
+      </div>
+    `);
+  }
+  $('chainView').innerHTML = cardsHtml.join('');
+
+  $('chainView').querySelectorAll('[data-tamper-idx]').forEach(btn => {
+    btn.onclick = async () => {
+      const idx = Number(btn.dataset.tamperIdx);
+      const blk = ledger.chain[idx];
+      if (!blk) return;
+      const curDetail = (blk.data && blk.data.detail) || JSON.stringify(blk.data);
+      const input = prompt(
+        `Simulasi Manipulasi Database pada Blok #${idx} (milik ${blk.username}):\nMasukkan teks detail baru untuk mengubah isi blok ini di database SQLite:`,
+        curDetail.includes('[DIUBAH PAKSA]') ? curDetail : curDetail + ' [DIUBAH PAKSA]'
+      );
+      if (input === null) return;
+      const baseAction = (blk.data && blk.data.action) ? blk.data.action.replace(/_TAMPERED$/, '') : 'LOG';
+      await ledger.tamperBlock(idx, {
+        action: `${baseAction}_TAMPERED`,
+        detail: input,
+      });
+      await renderChain();
+      await renderDb();
+      toast(`Blok #${idx} dimanipulasi! PERTAHANAN AKTIF (TAMPER LOCKDOWN) kini membekukan operasi brankas.`, true);
+    };
+  });
+
+  $('chainView').querySelectorAll('[data-restore-idx]').forEach(btn => {
+    btn.onclick = async () => {
+      const idx = Number(btn.dataset.restoreIdx);
+      await ledger.restoreBlock(idx);
+      await renderChain();
+      await renderDb();
+      const check = await ledger.isChainValid();
+      toast(
+        check.valid
+          ? `Blok #${idx} dipulihkan ke data asli. Integritas rantai kembali valid & Lockdown dicabut!`
+          : `Blok #${idx} dipulihkan. Masih ada blok lain yang belum dipulihkan (mulai Blok #${check.at}).`,
+        !check.valid
+      );
+    };
+  });
 }
 
 function dbReplacer(k, v) {
-  if (v instanceof ArrayBuffer) return `<binary ${v.byteLength} bytes>`;
-  if (v instanceof Uint8Array) return `<binary ${v.length} bytes>`;
-  if (k === 'faceDescriptor' && Array.isArray(v)) return `<float32[128] [${v.slice(0, 3).map(n => Number(n).toFixed(4)).join(', ')}, …]>`;
+  if (v instanceof ArrayBuffer) return `<BLOB ${v.byteLength} bytes>`;
+  if (v instanceof Uint8Array) return `<BLOB ${v.length} bytes>`;
+  if (k === 'faceDescriptor' && Array.isArray(v)) {
+    return `<float32[128] [${v.slice(0, 3).map(n => Number(n).toFixed(4)).join(', ')}, …]>`;
+  }
   return v;
 }
+
 async function renderDb() {
   const store = $('dbStore').value;
   const all = await getAllDatabaseData();
-  $('dbStats').textContent = Object.entries(all).map(([k, v]) => `${k}: ${v.length}`).join('  |  ');
+  $('dbStats').textContent = Object.entries(all).map(([k, v]) => `${k}: ${v.length} baris`).join('   ·   ');
   const rows = all[store] || [];
   const cols = [...new Set(rows.flatMap(r => Object.keys(r)))];
   $('dbTable').innerHTML = rows.length
     ? `<tr>${cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>` + rows.map(r => `<tr>${cols.map(c => {
         const v = r[c];
-        let s = typeof v === 'object' && v !== null ? JSON.stringify(v, (k, val) => dbReplacer(k || c, val)) : String(v ?? '');
-        return `<td>${esc(s.length > 200 ? s.slice(0, 200) + '…' : s)}</td>`;
+        const s = typeof v === 'object' && v !== null ? JSON.stringify(v, (k, val) => dbReplacer(k || c, val)) : String(v ?? '');
+        return `<td>${esc(s.length > 180 ? s.slice(0, 180) + '…' : s)}</td>`;
       }).join('')}</tr>`).join('')
-    : '<tr><td>(kosong)</td></tr>';
+    : '<tr><td class="muted">(Tabel kosong)</td></tr>';
 }
 
 function bindLedger() {
-  $('dbStore').innerHTML = DB_STORES.map(s => `<option>${s}</option>`).join('');
+  $('dbStore').innerHTML = DB_STORES.map(s => `<option value="${s}">${s}</option>`).join('');
   $('dbStore').onchange = renderDb;
   $('btnDbRefresh').onclick = renderDb;
   $('btnValidate').onclick = async () => {
     await renderChain();
     const ok = (await ledger.isChainValid()).valid;
-    toast(ok ? 'Rantai valid.' : 'Rantai tidak valid!', !ok);
+    toast(ok ? 'Integritas seluruh blok terverifikasi.' : 'Peringatan: Rantai blok telah dimanipulasi!', !ok);
   };
   $('btnTamper').onclick = async () => {
-    if (ledger.chain.length < 2) { toast('Butuh minimal 2 blok.', true); return; }
-    ledger.chain[1].data = { action: 'TAMPERED', detail: 'data dimanipulasi' };
+    if (ledger.chain.length < 2) { toast('Minimal harus terdapat 2 blok untuk simulasi.', true); return; }
+    await ledger.tamperBlock(1, {
+      action: 'TAMPERED',
+      detail: 'Data Blok #1 diubah secara paksa pada database [SIMULASI PENYUSUP]',
+    });
     await renderChain();
-    toast('Blok #1 dimodifikasi di memori (DB tidak berubah).', true);
+    await renderDb();
+    toast('Blok #1 dimodifikasi! PERTAHANAN AKTIF (TAMPER LOCKDOWN) membekukan brankas.', true);
   };
-  $('btnReloadChain').onclick = async () => { await ledger.load(); await renderChain(); toast('Rantai dimuat ulang dari database.'); };
+  const restoreAllHandler = async () => {
+    const count = await ledger.restoreAllBlocks();
+    await renderChain();
+    await renderDb();
+    toast(
+      count > 0
+        ? `Berhasil memulihkan ${count} blok ke data asli! Integritas terverifikasi & Lockdown dicabut.`
+        : 'Seluruh blok sudah berada pada data asli yang terverifikasi.'
+    );
+  };
+  $('btnReloadChain').onclick = restoreAllHandler;
+  if ($('btnLockdownRestore')) $('btnLockdownRestore').onclick = restoreAllHandler;
+  if ($('btnLockdownInspect')) {
+    $('btnLockdownInspect').onclick = () => {
+      showTab('ledger');
+    };
+  }
   $('btnDbExport').onclick = async () => {
     const all = await getAllDatabaseData();
-    downloadBlob(new Blob([JSON.stringify(all, dbReplacer, 2)], { type: 'application/json' }), 'secretnote-db-dump.json');
+    downloadBlob(new Blob([JSON.stringify(all, dbReplacer, 2)], { type: 'application/json' }), 'secret-note-db-export.json');
   };
   $('btnDbReset').onclick = async () => {
-    if (!confirm('Hapus SELURUH data (semua user, ledger, vault)?')) return;
+    if (!confirm('Kosongkan seluruh tabel database (users, vault_text, vault_files, blockchain_ledger)?')) return;
     stopUsbWatcher();
+    ledger.clearBackupStorage();
     await clearAllDatabaseData();
     location.reload();
   };
@@ -616,33 +1128,36 @@ function vigTable(steps, dir) {
        vis(s.resChar), s.c]
     : [vis(s.char), '—', '—', '—', 'pass-through (non-alfabet)', vis(s.resChar), '—']);
   const more = steps.length > MAX_ROWS ? note(`Menampilkan ${MAX_ROWS} dari ${steps.length} karakter.`) : '';
-  return table(['Huruf', inCol, 'Kunci', 'K (0..25)', 'Rumus Mod 26', 'Hasil', outCol], rows) + more;
+  return table(['Karakter', inCol, 'Kunci', 'K (0..25)', 'Rumus Modulo 26', 'Hasil', outCol], rows) + more;
 }
 
 function aesParams(a, maskedKey) {
   return kv('PBKDF2', `HMAC-SHA256, ${a.iterations.toLocaleString()} iterasi, passphrase "${maskedKey}"`)
-    + kv('Salt (16 B)', a.saltHex) + kv('Derived Key (256 b)', a.keyHex) + kv('IV (12 B)', a.ivHex);
+    + kv('Salt (16 B)', a.saltHex)
+    + kv('Derived Key (256 b)', a.keyHex)
+    + kv('IV (12 B)', a.ivHex)
+    + kv('Konteks Akun (AAD)', a.aadLabel);
 }
 
-const pkgBar = (a) => `<div class="pkg"><span class="p1">Salt 16B</span><span class="p2">IV 12B</span><span class="p3">Ciphertext ${a.ctHex.length / 2}B</span><span class="p4">Tag 16B</span></div>`;
+const pkgBar = (a) => `<div class="pkg"><span class="p1">Salt 16B</span><span class="p2">IV 12B</span><span class="p3">Ciphertext ${a.ctHex.length / 2}B</span><span class="p4">GCM Tag 16B</span></div>`;
 
 function renderEncryptSteps(r, vigKey, aesKey) {
   const a = r.aes;
   return [
-    stepBox(1, 'Input', kv('Plaintext', r.plaintext) + kv('Kunci Vigenère (A–Z)', vigKey) + kv('Kunci AES', '•'.repeat(aesKey.length) + ` (${aesKey.length} karakter)`) + kv('Panjang', `${r.plaintext.length} karakter / ${a.inputLen} byte`)),
-    stepBox(2, 'Lapis 1 — Vigenère Cipher Klasik (A–Z, Modulo 26)', note('Huruf alfabet dipetakan A=0 … Z=25 lalu digeser C = (P + K) mod 26. Karakter non-huruf (spasi, angka, simbol) di-bypass (pass-through) sesuai teori klasik.') + vigTable(r.vigSteps, 1) + kv('Hasil perantara', r.vigText)),
-    stepBox(3, 'Lapis 2 — AES-256-GCM (Modern)', note('Kunci 256-bit diturunkan dari passphrase memakai PBKDF2 + salt acak, lalu seluruh teks perantara (termasuk angka/simbol) dienkripsi AES-GCM.') + aesParams(a, '•'.repeat(aesKey.length)) + kv('Ciphertext (hex)', short(a.ctHex)) + kv('Auth Tag (16 B)', a.tagHex)),
-    stepBox(4, 'Packaging → Base64', note('Payload = Salt | IV | Ciphertext | Tag, lalu di-encode Base64 (' + a.payloadLen + ' byte).') + pkgBar(a) + kv('Ciphertext akhir', a.b64)),
+    stepBox(1, 'Parameter Masukan', kv('Plaintext', r.plaintext) + kv('Kunci Vigenère (A–Z)', vigKey) + kv('Passphrase AES', '•'.repeat(aesKey.length) + ` (${aesKey.length} karakter)`) + kv('Ukuran Data', `${r.plaintext.length} karakter / ${a.inputLen} byte`)),
+    stepBox(2, 'Tahap 1 — Vigenère Klasik (Alfabet A–Z, Modulo 26)', note('Setiap huruf alfabet dipetakan A=0 … Z=25 dan digeser dengan rumus C = (P + K) mod 26. Spasi, angka, dan tanda baca dilewatkan (pass-through) sesuai teori klasik.') + vigTable(r.vigSteps, 1) + kv('Output Tahap 1', r.vigText)),
+    stepBox(3, 'Tahap 2 — AES-256-GCM + Pengikatan Konteks Akun (AAD)', note('Kunci 256-bit diturunkan menggunakan PBKDF2. Identitas akun aktif diikat sebagai Additional Authenticated Data (AAD) sehingga ciphertext tidak dapat didekripsi oleh akun lain.') + aesParams(a, '•'.repeat(aesKey.length)) + kv('Ciphertext (hex)', short(a.ctHex)) + kv('GCM Auth Tag (16 B)', a.tagHex)),
+    stepBox(4, 'Pengemasan Payload Base64', note('Format paket biner: [Salt 16B | IV 12B | Ciphertext | GCM Tag 16B] (' + a.payloadLen + ' byte).') + pkgBar(a) + kv('Output Base64', a.b64)),
   ].join('');
 }
 
 function renderDecryptSteps(r, vigKey) {
   const a = r.aes;
   return [
-    stepBox(1, 'Unpack Base64', note(`Base64 di-decode menjadi ${a.payloadLen} byte lalu dipisah:`) + pkgBar(a) + kv('Salt', a.saltHex) + kv('IV', a.ivHex) + kv('Auth Tag', a.tagHex)),
-    stepBox(2, 'Lapis 2 (dibalik) — AES-256-GCM Decrypt', note('Kunci diturunkan ulang dari passphrase + salt yang sama. Tag diverifikasi; jika kunci salah / data diubah, dekripsi gagal.') + kv('PBKDF2', `HMAC-SHA256, ${a.iterations.toLocaleString()} iterasi`) + kv('Derived Key (256 b)', a.keyHex) + kv('Ciphertext (hex)', short(a.ctHex)) + kv('Hasil (Vigenère cipher)', r.vigCipher)),
-    stepBox(3, `Lapis 1 (dibalik) — Vigenère Klasik Decrypt (kunci "${esc(vigKey)}")`, note('Huruf dikembalikan dengan rumus P = (C − K + 26) mod 26; karakter non-huruf tetap.') + vigTable(r.vigSteps, -1)),
-    stepBox(4, 'Plaintext', kv('Plaintext', r.plain)),
+    stepBox(1, 'Pembongkaran Paket Base64', note(`Payload Base64 diuraikan kembali menjadi ${a.payloadLen} byte:`) + pkgBar(a) + kv('Salt (16 B)', a.saltHex) + kv('IV (12 B)', a.ivHex) + kv('GCM Auth Tag (16 B)', a.tagHex)),
+    stepBox(2, 'Tahap 2 (Dibalik) — Verifikasi Tag & Dekripsi AES-256-GCM', note('Kunci diturunkan ulang dengan salt yang sama. GCM memverifikasi keutuhan ciphertext sekaligus kesesuaian pemilik akun (AAD).') + kv('Konteks Akun (AAD)', a.aadLabel) + kv('Derived Key (256 b)', a.keyHex) + kv('Output AES (Vigenère)', r.vigCipher)),
+    stepBox(3, `Tahap 1 (Dibalik) — Dekripsi Vigenère Modulo 26 (Kunci "${esc(vigKey)}")`, note('Huruf dikembalikan dengan rumus P = (C − K + 26) mod 26.') + vigTable(r.vigSteps, -1)),
+    stepBox(4, 'Plaintext Terpulihkan', kv('Plaintext', r.plain)),
   ].join('');
 }
 
@@ -651,11 +1166,11 @@ function renderRc4Steps(t, encrypt) {
   const inLabel = encrypt ? 'Plaintext' : 'Ciphertext', outLabel = encrypt ? 'Ciphertext' : 'Plaintext';
   const p = t.package;
   return [
-    stepBox(1, 'KSA — Key Scheduling Algorithm', note('S-Box diinisialisasi S[i]=i, lalu diacak 256 putaran: j = (j + S[i] + key[i mod len]) mod 256; swap(S[i], S[j]).') + kv('Kunci (byte)', arr(t.keyBytes)) + kv('S[0..15] sebelum', arr(t.sBefore)) + kv('S[0..15] sesudah', arr(t.sAfter))),
-    stepBox(2, 'PRGA — Keystream Generator', note('Tiap byte: i++, j += S[i], swap(S[i],S[j]), K = S[(S[i]+S[j]) mod 256].') + kv('Keystream 16 byte', arr(t.keystream))),
-    stepBox(3, `XOR Bitwise — ${inLabel} ⊕ Keystream = ${outLabel}`, note(`10 byte pertama dari paket (diawali header "RC4F").`) + table(['#', `${inLabel} hex`, 'biner', 'Keystream', 'biner', `${outLabel} hex`, 'biner'],
+    stepBox(1, 'KSA — Key-Scheduling Algorithm', note('Array S[0..255] diinisialisasi S[i]=i, kemudian diacak 256 putaran menggunakan byte kunci: j = (j + S[i] + key[i mod len]) mod 256.') + kv('Byte Kunci', arr(t.keyBytes)) + kv('S[0..15] Awal', arr(t.sBefore)) + kv('S[0..15] Hasil KSA', arr(t.sAfter))),
+    stepBox(2, 'PRGA — Pseudo-Random Generation Algorithm', note('Membangkitkan aliran kunci (keystream) byte demi byte untuk di-XOR dengan data berkas.') + kv('Keystream 16 Byte Pertama', arr(t.keystream))),
+    stepBox(3, `Operasi Bitwise XOR — ${inLabel} ⊕ Keystream = ${outLabel}`, note('Sampel 10 byte pertama dari paket berkas:') + table(['Indeks', `${inLabel} (hex)`, 'Biner', 'Keystream', 'Biner', `${outLabel} (hex)`, 'Biner'],
       t.rows.map(r => [r.index, hx(r.input), bin8(r.input), hx(r.keystream), bin8(r.keystream), hx(r.output), bin8(r.output)]))),
-    stepBox(4, encrypt ? 'Packaging file .enc' : 'Unpack paket', `<div class="pkg"><span class="p1">Magic "${p.magic}" 4B</span><span class="p2">Nama len ${p.nameLen} → 2B</span><span class="p3">Nama "${esc(p.name)}" ${p.nameLen}B</span><span class="p4">Data ${p.dataLen}B</span></div>` + kv('Total', `${p.totalLen} byte (seluruhnya dienkripsi RC4)`)),
+    stepBox(4, encrypt ? 'Struktur Berkas .enc' : 'Pemulihan Header Berkas', `<div class="pkg"><span class="p1">Magic "${p.magic}" 4B</span><span class="p2">Panjang Nama 2B</span><span class="p3">Nama "${esc(p.name)}" (${p.nameLen}B)</span><span class="p4">Data ${p.dataLen}B</span></div>` + kv('Total Ukuran', `${p.totalLen} byte`)),
   ].join('');
 }
 
@@ -669,26 +1184,39 @@ function renderStegoSteps(t) {
   const pixRows = [];
   t.pixels.forEach(p => ['R', 'G', 'B'].forEach((ch, i) => {
     const changed = (p.before[i] & 1) !== (p.after[i] & 1);
-    pixRows.push([`#${p.index} ${ch}`, p.before[i], bitsLsb(p.before[i], false), `<b>${p.bits[i]}</b>`, p.after[i], bitsLsb(p.after[i], changed), changed ? 'berubah' : 'tetap']);
+    pixRows.push([`Piksel #${p.index} (${ch})`, p.before[i], bitsLsb(p.before[i], false), `<b>${p.bits[i]}</b>`, p.after[i], bitsLsb(p.after[i], changed), changed ? 'LSB Berubah' : 'Tetap']);
   }));
   return [
-    stepBox(1, 'Pesan → Bit', note('Pesan di-encode UTF-8, tiap byte menjadi 8 bit, lalu ditutup delimiter.') + table(['Char', 'Biner'], t.firstChars.map(c => [vis(c.char), c.bin])) + kv('Delimiter', t.delimiter) + kv('Total bit', `${t.messageBitLen} (pesan) + ${t.delimiter.length} (delimiter) = ${t.totalBitLen}`)),
-    stepBox(2, 'Pixel Bit Inspector — LSB sebelum vs sesudah', note('Bit terakhir (LSB, disorot) tiap kanal R/G/B diganti dengan bit pesan. Perubahan maksimal ±1 sehingga tidak terlihat mata.') + table(['Piksel/Kanal', 'Sebelum', 'Biner', 'Bit pesan', 'Sesudah', 'Biner', 'Status'], pixRows)),
-    stepBox(3, 'Kapasitas & Output', kv('Dimensi', `${t.width}×${t.height} px`) + kv('Kapasitas', `${t.capacityBits} bit (${t.capacityBytes} byte)`) + kv('Terpakai', `${t.totalBitLen} bit (${ratio}%)`) + note('Disimpan sebagai PNG (lossless) agar bit LSB tidak rusak oleh kompresi.')),
+    stepBox(1, 'Konversi Pesan ke Aliran Bit & Delimiter', note('Setiap karakter UTF-8 diubah ke 8 bit biner dan diakhiri penanda 16-bit (0xFFFE).') + table(['Karakter', 'Representasi Biner'], t.firstChars.map(c => [vis(c.char), c.bin])) + kv('Delimiter Penutup', t.delimiter) + kv('Jumlah Bit', `${t.messageBitLen} bit pesan + ${t.delimiter.length} bit delimiter = ${t.totalBitLen} bit`)),
+    stepBox(2, 'Perbandingan Bit Piksel (Sebelum vs Sesudah)', note('Bit paling kanan (LSB) pada kanal R, G, dan B digantikan oleh bit pesan.') + table(['Kanal Piksel', 'Nilai Awal', 'Biner Awal', 'Bit Pesan', 'Nilai Akhir', 'Biner Akhir', 'Status'], pixRows)),
+    stepBox(3, 'Kapasitas Citra & Kamuflase Ukuran Berkas (Anti-Deteksi)',
+      kv('Resolusi Citra', `${t.width}×${t.height} piksel`)
+      + kv('Kapasitas Total', `${t.capacityBits.toLocaleString('id-ID')} bit (${t.capacityBytes.toLocaleString('id-ID')} byte)`)
+      + kv('Kapasitas Terpakai', `${t.totalBitLen} bit (${ratio}%)`)
+      + kv('Ukuran Unggahan Asli', `${(t.origUploadBytes || 0).toLocaleString('id-ID')} byte (${t.isOrigPng ? 'PNG' : 'Non-PNG'})`)
+      + kv('Ukuran Hasil Kompresi Mentah', `Sampul: ${t.rawCoverPngBytes.toLocaleString('id-ID')} B · Stego: ${t.rawStegoPngBytes.toLocaleString('id-ID')} B (selisih alami ${Math.abs(t.rawStegoPngBytes - t.rawCoverPngBytes)} B)`)
+      + kv('Ukuran Akhir Terstandarisasi', `Sampul: ${t.coverFinalBytes.toLocaleString('id-ID')} byte · Stego: ${t.stegoFinalBytes.toLocaleString('id-ID')} byte (Selisih: ${t.sizeDiffBytes} byte / 0.000%)`)
+      + note('Menggunakan Adaptive 24-bit RGB PNG Encoder (tanpa channel Alpha mubazir) dan penyamaan ukuran byte (Byte-Size Equalization) sehingga ukuran berkas sebelum dan sesudah penyisipan identik hingga ke satuan byte.')
+    ),
   ].join('');
 }
 
 // ══ INIT ═════════════════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', async () => {
   document.querySelectorAll('.tab').forEach(t => t.onclick = () => showTab(t.dataset.tab));
-  bindLogin(); bindText(); bindFile(); bindStego(); bindLedger();
+  bindLogin();
+  bindText();
+  bindFile();
+  bindStego();
+  bindLedger();
   try {
-    await initDB();
+    const usingSqlite = await initDB();
+    $('storageEngineLabel').textContent = usingSqlite ? 'SQLite Engine (secret-note.db)' : 'IndexedDB Engine';
     await ledger.load();
-    await refreshUserList();
-    renderChain();
+    resetGatekeeperState();
+    preloadFaceModels();
   } catch (e) {
-    toast('Gagal inisialisasi database: ' + e.message, true);
+    toast('Gagal menyiapkan database: ' + e.message, true);
     console.error(e);
   }
 });
