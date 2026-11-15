@@ -45,8 +45,41 @@ class Block {
   }
 }
 
+const LEDGER_BACKUP_KEY = 'secretNote_ledgerOriginalSnapshot_v1';
+
 class Blockchain {
-  constructor() { this.chain = []; }
+  constructor() {
+    this.chain = [];
+    this.originalSnapshot = this._loadBackupStorage();
+  }
+  _loadBackupStorage() {
+    try {
+      const raw = localStorage.getItem(LEDGER_BACKUP_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  }
+  _saveBackupStorage() {
+    try {
+      localStorage.setItem(LEDGER_BACKUP_KEY, JSON.stringify(this.originalSnapshot));
+    } catch { /* abaikan quota */ }
+  }
+  _backupValidBlock(blk) {
+    this.originalSnapshot[blk.index] = {
+      index: blk.index,
+      timestamp: blk.timestamp,
+      username: blk.username,
+      data: JSON.parse(JSON.stringify(blk.data)),
+      previousHash: blk.previousHash,
+      hash: blk.hash,
+    };
+    this._saveBackupStorage();
+  }
+  clearBackupStorage() {
+    this.originalSnapshot = {};
+    try { localStorage.removeItem(LEDGER_BACKUP_KEY); } catch { /* ignore */ }
+  }
   async createGenesisBlock() {
     return Block.create(0, new Date().toISOString(), 'SYSTEM', {
       action: 'GENESIS',
@@ -58,6 +91,7 @@ class Blockchain {
     newBlock.previousHash = this.getLatestBlock().hash;
     newBlock.hash = await newBlock.calculateHash();
     this.chain.push(newBlock);
+    this._backupValidBlock(newBlock);
     await addBlockToDB(newBlock);
     return newBlock;
   }
@@ -69,24 +103,113 @@ class Blockchain {
     }
     return { valid: true };
   }
+  async tamperBlock(index, newData) {
+    const blk = this.chain[index];
+    if (!blk) return false;
+    // Pastikan data asli tersimpan di snapshot sebelum dimanipulasi
+    if (blk.hash === await blk.calculateHash() && !this.originalSnapshot[index]) {
+      this._backupValidBlock(blk);
+    }
+    blk.data = newData;
+    await addBlockToDB(blk);
+    return true;
+  }
+  async restoreBlock(index) {
+    const blk = this.chain[index];
+    const snap = this.originalSnapshot[index];
+    if (!blk || !snap) return false;
+    blk.timestamp = snap.timestamp;
+    blk.username = snap.username;
+    blk.data = JSON.parse(JSON.stringify(snap.data));
+    blk.previousHash = snap.previousHash;
+    blk.hash = snap.hash;
+    await addBlockToDB(blk);
+    return true;
+  }
+  async restoreAllBlocks() {
+    let restoredCount = 0;
+    for (let i = 0; i < this.chain.length; i++) {
+      const blk = this.chain[i];
+      const actual = await blk.calculateHash();
+      const prevMismatch = i > 0 && blk.previousHash !== this.chain[i - 1].hash;
+      if (blk.hash !== actual || prevMismatch) {
+        if (this.originalSnapshot[i]) {
+          await this.restoreBlock(i);
+          restoredCount++;
+        } else {
+          // Fallback apabila dimanipulasi di luar aplikasi tanpa snapshot
+          if (i > 0) blk.previousHash = this.chain[i - 1].hash;
+          blk.hash = await blk.calculateHash();
+          this._backupValidBlock(blk);
+          await addBlockToDB(blk);
+          restoredCount++;
+        }
+      }
+    }
+    return restoredCount;
+  }
   async load() {
     const recs = await getAllBlocksFromDB();
     this.chain = [];
-    for (const r of recs) this.chain.push(await Block.fromRecord(r));
+    for (const r of recs) {
+      const b = await Block.fromRecord(r);
+      this.chain.push(b);
+      if (b.hash === await b.calculateHash()) {
+        this._backupValidBlock(b);
+      }
+    }
     if (!this.chain.length) {
+      this.clearBackupStorage();
       const g = await this.createGenesisBlock();
       this.chain.push(g);
+      this._backupValidBlock(g);
       await addBlockToDB(g);
     }
   }
 }
 
 const ledger = new Blockchain();
+let isTamperLockdown = false;
+let tamperStartBlock = null;
+
+async function assertLedgerIntegrity() {
+  const res = await ledger.isChainValid();
+  if (!res.valid) {
+    await renderChain();
+    throw new Error(
+      `PERTAHANAN AKTIF [TAMPER LOCKDOWN]: Integritas Blockchain rusak mulai Blok #${res.at}! Operasi brankas dibekukan sampai data asli dipulihkan.`
+    );
+  }
+}
+
+function syncLockdownUI(res) {
+  isTamperLockdown = !res.valid;
+  tamperStartBlock = res.valid ? null : res.at;
+  const banner = $('lockdownBanner');
+  const tabLedger = $('tabBtnLedger');
+  if (banner) {
+    banner.classList.toggle('hidden', res.valid);
+    if (!res.valid && $('lockdownText')) {
+      $('lockdownText').textContent =
+        `Manipulasi database terdeteksi mulai Blok #${res.at}! Seluruh operasi Enkripsi, Dekripsi, Simpan, dan Steganografi dibekukan sementara.`;
+    }
+  }
+  if (tabLedger) {
+    tabLedger.classList.toggle('alert-tab', !res.valid);
+    tabLedger.textContent = res.valid ? 'Audit & Database' : `Audit & Database [LOCKDOWN #${res.at}]`;
+  }
+}
 
 async function logAction(action, detail, actor = null) {
   const user = actor || currentActiveUser || (selectedUser && selectedUser.username) || 'SYSTEM';
+  // Jika rantai sedang dalam mode simulasi manipulasi, jangan timpa blok di atas rantai yang rusak
+  const check = await ledger.isChainValid();
+  if (!check.valid) {
+    if (loggedIn) await renderChain();
+    return;
+  }
   await ledger.addBlock(new Block(ledger.chain.length, new Date().toISOString(), user, { action, detail }));
-  if (loggedIn) renderChain();
+  if (loggedIn) await renderChain();
 }
 
 // ══ UTIL UI ══════════════════════════════════════════════════════════════════
@@ -558,6 +681,7 @@ function bindText() {
 
   $('btnTextEnc').onclick = () => guard($('btnTextEnc'), async () => {
     if (!currentActiveUser) throw new Error('Sesi brankas tidak aktif.');
+    await assertLedgerIntegrity();
     const text = $('textInput').value;
     if (!text) throw new Error('Masukkan teks yang akan dienkripsi.');
     const r = await superEncryptTrace(text, $('vigKey').value, $('aesKey').value, currentActiveUser);
@@ -574,6 +698,7 @@ function bindText() {
 
   $('btnTextDec').onclick = () => guard($('btnTextDec'), async () => {
     if (!currentActiveUser) throw new Error('Sesi brankas tidak aktif.');
+    await assertLedgerIntegrity();
     const r = await superDecryptTrace($('textInput').value, $('vigKey').value, $('aesKey').value, currentActiveUser);
     $('textLayer1').value = r.vigCipher;
     $('textOutput').value = r.plain;
@@ -583,6 +708,7 @@ function bindText() {
 
   $('btnTextSave').onclick = () => guard($('btnTextSave'), async () => {
     if (!currentActiveUser) throw new Error('Sesi brankas tidak aktif.');
+    await assertLedgerIntegrity();
     if (!lastCipher) throw new Error('Enkripsi catatan terlebih dahulu sebelum menyimpan ke brankas.');
     const title = $('noteTitle').value.trim() || `Catatan #${new Date().toLocaleTimeString('id-ID')}`;
     await saveVaultText({
@@ -631,11 +757,12 @@ async function renderVaultText() {
   });
 
   $('vaultTextList').querySelectorAll('[data-del]').forEach(b => {
-    b.onclick = async () => {
+    b.onclick = () => guard(b, async () => {
+      await assertLedgerIntegrity();
       await deleteVaultText(Number(b.dataset.del), currentActiveUser);
       renderVaultText();
       toast('Catatan dihapus dari brankas.');
-    };
+    });
   });
 }
 
@@ -666,6 +793,7 @@ function bindFile() {
 
   $('btnFileEnc').onclick = () => guard($('btnFileEnc'), async () => {
     if (!currentActiveUser) throw new Error('Sesi brankas tidak aktif.');
+    await assertLedgerIntegrity();
     if (!selectedFile) throw new Error('Pilih berkas terlebih dahulu.');
     if (!$('fileKey').value) throw new Error('Masukkan kunci RC4.');
     const { bytes: enc, trace } = await encryptFileRC4(selectedFile, $('fileKey').value);
@@ -686,6 +814,7 @@ function bindFile() {
   });
 
   $('btnFileDec').onclick = () => guard($('btnFileDec'), async () => {
+    await assertLedgerIntegrity();
     if (!selectedFile) throw new Error('Pilih berkas .enc yang akan didekripsi.');
     if (!$('fileKey').value) throw new Error('Masukkan kunci RC4.');
     const r = await decryptFileRC4(selectedFile, $('fileKey').value);
@@ -727,11 +856,12 @@ async function renderVaultFiles() {
   });
 
   $('vaultFileList').querySelectorAll('[data-del]').forEach(b => {
-    b.onclick = async () => {
+    b.onclick = () => guard(b, async () => {
+      await assertLedgerIntegrity();
       await deleteVaultFile(Number(b.dataset.del));
       renderVaultFiles();
       toast('Berkas dihapus dari brankas.');
-    };
+    });
   });
 }
 
@@ -754,6 +884,7 @@ function bindStego() {
   };
 
   $('btnEmbed').onclick = () => guard($('btnEmbed'), async () => {
+    await assertLedgerIntegrity();
     if ($('coverImg').classList.contains('hidden')) throw new Error('Pilih citra sampul terlebih dahulu.');
     const msg = $('stegoMsg').value;
     if (!msg) throw new Error('Masukkan pesan rahasia yang akan disisipkan.');
@@ -804,6 +935,7 @@ function bindStego() {
   };
 
   $('btnExtract').onclick = () => guard($('btnExtract'), async () => {
+    await assertLedgerIntegrity();
     if ($('stegoIn').classList.contains('hidden')) throw new Error('Pilih berkas Stego-Image (.png) terlebih dahulu.');
     $('stegoExtracted').value = extractLSB($('stegoIn'));
     toast('Pesan tersembunyi berhasil diekstrak.');
@@ -813,20 +945,56 @@ function bindStego() {
 // ══ PANEL 4: BLOCKCHAIN LEDGER & DATABASE INSPECTOR ══════════════════════════
 async function renderChain() {
   const res = await ledger.isChainValid();
+  syncLockdownUI(res);
+
   const badge = $('chainBadge');
-  badge.textContent = res.valid ? `TERVERIFIKASI · ${ledger.chain.length} BLOK` : `TERDETEKSI MANIPULASI (MULAI BLOK #${res.at})`;
+  badge.textContent = res.valid
+    ? `TERVERIFIKASI · ${ledger.chain.length} BLOK`
+    : `LOCKDOWN AKTIF · MANIPULASI MULAI BLOK #${res.at}`;
   badge.className = 'badge ' + (res.valid ? 'ok' : 'bad');
-  $('chainView').innerHTML = ledger.chain.map((b, i) => `
-    <div class="block ${!res.valid && i >= res.at ? 'bad' : ''}">
-      <div class="block-head">
-        <span>BLOK #${b.index} · ${esc(b.username)}</span>
-        <button class="btn ghost tiny" data-tamper-idx="${b.index}">Ubah Data Blok #${b.index}</button>
+
+  const cardsHtml = [];
+  for (let i = 0; i < ledger.chain.length; i++) {
+    const b = ledger.chain[i];
+    const actualHash = await b.calculateHash();
+    const isDirectTamper = actualHash !== b.hash;
+    const isDominoBreak = !isDirectTamper && !res.valid && i >= res.at;
+
+    const cardClass = isDirectTamper ? 'block bad' : (isDominoBreak ? 'block domino' : 'block');
+    let statusTag = '';
+    if (isDirectTamper) {
+      statusTag = `<span class="block-status-tag tampered">DATA BLOK DIMANIPULASI</span>`;
+    } else if (isDominoBreak) {
+      statusTag = `<span class="block-status-tag domino">EFEK DOMINO · RANTAI PUTUS DARI BLOK #${res.at}</span>`;
+    }
+
+    const restoreBtn = isDirectTamper
+      ? `<button class="btn primary tiny" data-restore-idx="${b.index}">Pulihkan Blok #${b.index}</button>`
+      : '';
+
+    const hashComparison = isDirectTamper
+      ? `<div><b>Hash Tersimpan:</b> <span class="hash">${esc(b.hash)}</span></div>
+         <div><b>Hash Hitung Ulang:</b> <span class="hash mismatch">${esc(actualHash)} (TIDAK COCOK!)</span></div>`
+      : `<div><b>Hash:</b> <span class="hash">${esc(b.hash)}</span></div>`;
+
+    cardsHtml.push(`
+      <div class="${cardClass}">
+        <div class="block-head">
+          <span>BLOK #${b.index} · ${esc(b.username)}</span>
+          <div class="row">
+            ${restoreBtn}
+            <button class="btn ghost tiny" data-tamper-idx="${b.index}">Ubah Data Blok #${b.index}</button>
+          </div>
+        </div>
+        ${statusTag ? `<div>${statusTag}</div>` : ''}
+        <div class="mono-meta">${esc(new Date(b.timestamp).toLocaleString('id-ID'))}</div>
+        <div><b>Data:</b> <code>${esc(JSON.stringify(b.data))}</code></div>
+        <div><b>Prev:</b> <span class="hash">${esc(b.previousHash)}</span></div>
+        ${hashComparison}
       </div>
-      <div class="mono-meta">${esc(new Date(b.timestamp).toLocaleString('id-ID'))}</div>
-      <div><b>Data:</b> <code>${esc(JSON.stringify(b.data))}</code></div>
-      <div><b>Prev:</b> <span class="hash">${esc(b.previousHash)}</span></div>
-      <div><b>Hash:</b> <span class="hash">${esc(b.hash)}</span></div>
-    </div>`).join('');
+    `);
+  }
+  $('chainView').innerHTML = cardsHtml.join('');
 
   $('chainView').querySelectorAll('[data-tamper-idx]').forEach(btn => {
     btn.onclick = async () => {
@@ -834,14 +1002,35 @@ async function renderChain() {
       const blk = ledger.chain[idx];
       if (!blk) return;
       const curDetail = (blk.data && blk.data.detail) || JSON.stringify(blk.data);
-      const input = prompt(`Simulasi Manipulasi pada Blok #${idx} (milik ${blk.username}):\nMasukkan teks detail baru untuk mengubah isi blok ini di memori:`, curDetail + ' [DIUBAH PAKSA]');
+      const input = prompt(
+        `Simulasi Manipulasi Database pada Blok #${idx} (milik ${blk.username}):\nMasukkan teks detail baru untuk mengubah isi blok ini di database SQLite:`,
+        curDetail.includes('[DIUBAH PAKSA]') ? curDetail : curDetail + ' [DIUBAH PAKSA]'
+      );
       if (input === null) return;
-      blk.data = {
-        action: (blk.data && blk.data.action) ? `${blk.data.action}_TAMPERED` : 'TAMPERED',
+      const baseAction = (blk.data && blk.data.action) ? blk.data.action.replace(/_TAMPERED$/, '') : 'LOG';
+      await ledger.tamperBlock(idx, {
+        action: `${baseAction}_TAMPERED`,
         detail: input,
-      };
+      });
       await renderChain();
-      toast(`Blok #${idx} telah dimodifikasi. Perhatikan rantai mulai Blok #${idx} ke atas terdeteksi tidak valid!`, true);
+      await renderDb();
+      toast(`Blok #${idx} dimanipulasi! PERTAHANAN AKTIF (TAMPER LOCKDOWN) kini membekukan operasi brankas.`, true);
+    };
+  });
+
+  $('chainView').querySelectorAll('[data-restore-idx]').forEach(btn => {
+    btn.onclick = async () => {
+      const idx = Number(btn.dataset.restoreIdx);
+      await ledger.restoreBlock(idx);
+      await renderChain();
+      await renderDb();
+      const check = await ledger.isChainValid();
+      toast(
+        check.valid
+          ? `Blok #${idx} dipulihkan ke data asli. Integritas rantai kembali valid & Lockdown dicabut!`
+          : `Blok #${idx} dipulihkan. Masih ada blok lain yang belum dipulihkan (mulai Blok #${check.at}).`,
+        !check.valid
+      );
     };
   });
 }
@@ -881,15 +1070,31 @@ function bindLedger() {
   };
   $('btnTamper').onclick = async () => {
     if (ledger.chain.length < 2) { toast('Minimal harus terdapat 2 blok untuk simulasi.', true); return; }
-    ledger.chain[1].data = { action: 'TAMPERED', detail: 'Data blok diubah secara paksa di memori' };
+    await ledger.tamperBlock(1, {
+      action: 'TAMPERED',
+      detail: 'Data Blok #1 diubah secara paksa pada database [SIMULASI PENYUSUP]',
+    });
     await renderChain();
-    toast('Blok #1 dimodifikasi di memori — perhatikan status rantai berubah merah.', true);
+    await renderDb();
+    toast('Blok #1 dimodifikasi! PERTAHANAN AKTIF (TAMPER LOCKDOWN) membekukan brankas.', true);
   };
-  $('btnReloadChain').onclick = async () => {
-    await ledger.load();
+  const restoreAllHandler = async () => {
+    const count = await ledger.restoreAllBlocks();
     await renderChain();
-    toast('Rantai blok dipulihkan dari database.');
+    await renderDb();
+    toast(
+      count > 0
+        ? `Berhasil memulihkan ${count} blok ke data asli! Integritas terverifikasi & Lockdown dicabut.`
+        : 'Seluruh blok sudah berada pada data asli yang terverifikasi.'
+    );
   };
+  $('btnReloadChain').onclick = restoreAllHandler;
+  if ($('btnLockdownRestore')) $('btnLockdownRestore').onclick = restoreAllHandler;
+  if ($('btnLockdownInspect')) {
+    $('btnLockdownInspect').onclick = () => {
+      showTab('ledger');
+    };
+  }
   $('btnDbExport').onclick = async () => {
     const all = await getAllDatabaseData();
     downloadBlob(new Blob([JSON.stringify(all, dbReplacer, 2)], { type: 'application/json' }), 'secret-note-db-export.json');
@@ -897,6 +1102,7 @@ function bindLedger() {
   $('btnDbReset').onclick = async () => {
     if (!confirm('Kosongkan seluruh tabel database (users, vault_text, vault_files, blockchain_ledger)?')) return;
     stopUsbWatcher();
+    ledger.clearBackupStorage();
     await clearAllDatabaseData();
     location.reload();
   };

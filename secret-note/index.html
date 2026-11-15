@@ -151,7 +151,7 @@
         <button class="tab active" data-tab="text">Catatan Rahasia</button>
         <button class="tab" data-tab="file">Enkripsi Berkas</button>
         <button class="tab" data-tab="stego">Steganografi Citra</button>
-        <button class="tab" data-tab="ledger">Audit &amp; Database</button>
+        <button class="tab" data-tab="ledger" id="tabBtnLedger">Audit &amp; Database</button>
       </nav>
 
       <div class="session">
@@ -161,6 +161,18 @@
         <button id="btnLogout" class="btn danger small">Kunci Brankas</button>
       </div>
     </header>
+
+    <!-- BANNER PERTAHANAN AKTIF (ACTIVE TAMPER LOCKDOWN) -->
+    <div id="lockdownBanner" class="lockdown-banner hidden">
+      <div class="lockdown-info">
+        <span class="badge bad">PERTAHANAN AKTIF · TAMPER LOCKDOWN</span>
+        <span id="lockdownText">Manipulasi terdeteksi pada rantai blok SHA-256! Seluruh operasi kriptografi dan modifikasi brankas dibekukan sementara.</span>
+      </div>
+      <div class="row">
+        <button id="btnLockdownInspect" class="btn ghost small">Lihat Blok Rusak</button>
+        <button id="btnLockdownRestore" class="btn primary small">Pulihkan Data Asli</button>
+      </div>
+    </div>
 
     <main class="workspace-main">
       <!-- PANEL 1: SUPER-ENCRYPTION TEKS -->
@@ -367,8 +379,8 @@
             </div>
             <div class="row">
               <button id="btnValidate" class="btn small">Verifikasi Integritas</button>
-              <button id="btnTamper" class="btn warn small">Uji Manipulasi Blok #1</button>
-              <button id="btnReloadChain" class="btn small">Pulihkan dari Database</button>
+              <button id="btnTamper" class="btn warn small">Simulasi Manipulasi Blok #1</button>
+              <button id="btnReloadChain" class="btn primary small">Pulihkan Data Asli</button>
             </div>
           </div>
           <div id="chainView" class="chain"></div>
