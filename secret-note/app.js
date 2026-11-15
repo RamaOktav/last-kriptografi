@@ -288,10 +288,18 @@ function applyVerifiedDongle(r, mode) {
   setStatus(
     'faceStatus',
     hasFace
-      ? `Kunci milik "${selectedUser.username}" dikenali. Klik "Pindai Wajah" untuk mencocokkan vektor wajah.`
+      ? `Kunci milik "${selectedUser.username}" dikenali. Menyiapkan kamera untuk verifikasi wajah...`
       : `Akun "${selectedUser.username}" menggunakan mode simulasi wajah. Klik "Pindai Wajah".`
   );
   updateGatekeeperProgress();
+
+  // Panaskan kamera & model AI lebih awal begitu Tahap 01 lolos agar Tahap 02 tidak ada delay
+  preloadFaceModels();
+  if (hasFace && !$('faceSim').checked) {
+    _startCamera($('faceVideo')).then(() => {
+      setStatus('faceStatus', `Kamera siap untuk "${selectedUser.username}". Klik "Pindai Wajah".`);
+    }).catch(() => { /* jika belum diizinkan, akan diminta saat klik Pindai Wajah */ });
+  }
 }
 
 /** Callback otomatis saat USB flashdrive dicabut pada tengah sesi. */
@@ -360,7 +368,7 @@ function bindLogin() {
   // Tahap 2: Verifikasi Wajah
   const faceMsg = m => setStatus('faceStatus', m);
   const faceFail = (e) => {
-    stopFaceScan();
+    cancelFaceScanLoop();
     setStatus('faceStatus', (e.message || e) + ' — centang simulasi apabila perangkat tanpa kamera.', 'err');
     throw e;
   };
@@ -443,9 +451,15 @@ function bindLogin() {
     $('regPin').value = '';
     $('regPin2').value = '';
     $('regFaceSkip').checked = false;
-    setStatus('regFaceStatus', 'Wajah belum direkam');
+    setStatus('regFaceStatus', 'Menyiapkan kamera...');
     $('regStatus').classList.add('hidden');
     $('regModal').classList.remove('hidden');
+    preloadFaceModels();
+    _startCamera($('regVideo')).then(() => {
+      setStatus('regFaceStatus', 'Kamera aktif — posisikan wajah lalu klik "Rekam Sampel Wajah".');
+    }).catch(() => {
+      setStatus('regFaceStatus', 'Klik "Rekam Sampel Wajah" untuk mengizinkan akses kamera.');
+    });
   };
   const closeRegModal = () => {
     stopFaceScan();
@@ -461,16 +475,16 @@ function bindLogin() {
     }
     try {
       const desc = await scanFaceDescriptor($('regVideo'), $('regCanvas'), m => setStatus('regFaceStatus', m), {
-        samples: 5,
-        timeoutMs: 25000,
+        samples: 3,
+        timeoutMs: 20000,
         verb: 'Merekam',
       });
       regFaceDesc = Array.from(desc);
-      stopFaceScan();
+      cancelFaceScanLoop();
       const norm = Math.sqrt(regFaceDesc.reduce((s, v) => s + v * v, 0)).toFixed(3);
       setStatus('regFaceStatus', `Vektor wajah 128-d berhasil direkam (norm=${norm}).`, 'ok');
     } catch (e) {
-      stopFaceScan();
+      cancelFaceScanLoop();
       setStatus('regFaceStatus', e.message || String(e), 'err');
       throw e;
     }
@@ -800,18 +814,36 @@ function bindStego() {
 async function renderChain() {
   const res = await ledger.isChainValid();
   const badge = $('chainBadge');
-  badge.textContent = res.valid ? `TERVERIFIKASI · ${ledger.chain.length} BLOK` : `TERDETEKSI MANIPULASI (BLOK #${res.at})`;
+  badge.textContent = res.valid ? `TERVERIFIKASI · ${ledger.chain.length} BLOK` : `TERDETEKSI MANIPULASI (MULAI BLOK #${res.at})`;
   badge.className = 'badge ' + (res.valid ? 'ok' : 'bad');
   $('chainView').innerHTML = ledger.chain.map((b, i) => `
     <div class="block ${!res.valid && i >= res.at ? 'bad' : ''}">
       <div class="block-head">
         <span>BLOK #${b.index} · ${esc(b.username)}</span>
-        <span>${esc(new Date(b.timestamp).toLocaleString('id-ID'))}</span>
+        <button class="btn ghost tiny" data-tamper-idx="${b.index}">Ubah Data Blok #${b.index}</button>
       </div>
+      <div class="mono-meta">${esc(new Date(b.timestamp).toLocaleString('id-ID'))}</div>
       <div><b>Data:</b> <code>${esc(JSON.stringify(b.data))}</code></div>
       <div><b>Prev:</b> <span class="hash">${esc(b.previousHash)}</span></div>
       <div><b>Hash:</b> <span class="hash">${esc(b.hash)}</span></div>
     </div>`).join('');
+
+  $('chainView').querySelectorAll('[data-tamper-idx]').forEach(btn => {
+    btn.onclick = async () => {
+      const idx = Number(btn.dataset.tamperIdx);
+      const blk = ledger.chain[idx];
+      if (!blk) return;
+      const curDetail = (blk.data && blk.data.detail) || JSON.stringify(blk.data);
+      const input = prompt(`Simulasi Manipulasi pada Blok #${idx} (milik ${blk.username}):\nMasukkan teks detail baru untuk mengubah isi blok ini di memori:`, curDetail + ' [DIUBAH PAKSA]');
+      if (input === null) return;
+      blk.data = {
+        action: (blk.data && blk.data.action) ? `${blk.data.action}_TAMPERED` : 'TAMPERED',
+        detail: input,
+      };
+      await renderChain();
+      toast(`Blok #${idx} telah dimodifikasi. Perhatikan rantai mulai Blok #${idx} ke atas terdeteksi tidak valid!`, true);
+    };
+  });
 }
 
 function dbReplacer(k, v) {
@@ -976,6 +1008,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     $('storageEngineLabel').textContent = usingSqlite ? 'SQLite Engine (secret-note.db)' : 'IndexedDB Engine';
     await ledger.load();
     resetGatekeeperState();
+    preloadFaceModels();
   } catch (e) {
     toast('Gagal menyiapkan database: ' + e.message, true);
     console.error(e);

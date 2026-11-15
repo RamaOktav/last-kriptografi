@@ -421,10 +421,10 @@ const DB_ADMIN_HTML = `<!DOCTYPE html>
     let activeTable = 'users';
 
     const TABLE_QUERIES = {
-      users: 'SELECT username, pin_hash, dongle_serial, substr(face_descriptor, 1, 60) || "…" AS face_descriptor_128d, created_at FROM users;',
-      vault_text: 'SELECT id, username, title, ciphertext, created_at FROM vault_text ORDER BY id DESC;',
-      vault_files: 'SELECT id, username, original_name, size, sha256, "<BLOB " || length(data) || " bytes>" AS data_blob, created_at FROM vault_files ORDER BY id DESC;',
-      blockchain_ledger: 'SELECT idx, timestamp, username, data, previous_hash, hash FROM blockchain_ledger ORDER BY idx ASC;'
+      users: "SELECT username, pin_hash, dongle_serial, substr(face_descriptor, 1, 60) || '…' AS face_descriptor_128d, created_at FROM users;",
+      vault_text: "SELECT id, username, title, ciphertext, created_at FROM vault_text ORDER BY id DESC;",
+      vault_files: "SELECT id, username, original_name, size, sha256, '<BLOB ' || length(data) || ' bytes>' AS data_blob, created_at FROM vault_files ORDER BY id DESC;",
+      blockchain_ledger: "SELECT idx, timestamp, username, data, previous_hash, hash FROM blockchain_ledger ORDER BY idx ASC;"
     };
 
     async function loadOverview() {
