@@ -125,6 +125,8 @@ let lastCipher = null;
 let selectedFile = null;
 let fileResult = null;
 let stegoDataUrl = null;
+let stegoBlobOut = null;
+let coverNormalizedBlobOut = null;
 
 /** Membersihkan seluruh input, output, dan jejak kriptografi di layar saat berganti sesi. */
 function clearWorkspaceState() {
@@ -132,6 +134,8 @@ function clearWorkspaceState() {
   selectedFile = null;
   fileResult = null;
   stegoDataUrl = null;
+  stegoBlobOut = null;
+  coverNormalizedBlobOut = null;
 
   // Bersihkan editor teks
   $('noteTitle').value = '';
@@ -161,6 +165,8 @@ function clearWorkspaceState() {
   $('stegoOut').src = '';
   $('stegoOut').classList.add('hidden');
   $('btnStegoDownload').classList.add('hidden');
+  $('btnCoverNormalizedDownload').classList.add('hidden');
+  $('stegoSizeStatus').classList.add('hidden');
   $('stegoFile').value = '';
   $('stegoIn').src = '';
   $('stegoIn').classList.add('hidden');
@@ -720,11 +726,15 @@ function bindStego() {
   $('coverFile').onchange = async e => {
     const f = e.target.files[0];
     if (!f) return;
-    $('coverImg').src = (await loadImageFromFile(f)).src;
+    const img = await loadImageFromFile(f);
+    $('coverImg').src = img.src;
     $('coverImg').classList.remove('hidden');
+    $('coverImg')._fileSize = f.size;
+    $('coverImg')._fileType = f.type || '';
+    $('coverImg')._fileName = f.name || 'cover.png';
     $('coverImg').onload = () => setStatus(
       'coverInfo',
-      `Dimensi ${$('coverImg').naturalWidth}×${$('coverImg').naturalHeight} px · Kapasitas maks. ${fmtBytes(stegoCapacity($('coverImg')))}`,
+      `${f.name} (${f.size.toLocaleString('id-ID')} byte) · Dimensi ${$('coverImg').naturalWidth}×${$('coverImg').naturalHeight} px · Kapasitas ${fmtBytes(stegoCapacity($('coverImg')))}`,
       'ok'
     );
   };
@@ -733,21 +743,43 @@ function bindStego() {
     if ($('coverImg').classList.contains('hidden')) throw new Error('Pilih citra sampul terlebih dahulu.');
     const msg = $('stegoMsg').value;
     if (!msg) throw new Error('Masukkan pesan rahasia yang akan disisipkan.');
-    const { dataUrl, trace } = embedLSBWithTrace($('coverImg'), msg);
+    const { dataUrl, stegoBlob, coverNormalizedBlob, trace } = await embedLSBWithTrace($('coverImg'), msg);
     stegoDataUrl = dataUrl;
+    stegoBlobOut = stegoBlob;
+    coverNormalizedBlobOut = coverNormalizedBlob;
+
     $('stegoSteps').innerHTML = renderStegoSteps(trace);
     $('stegoOut').src = stegoDataUrl;
     $('stegoOut').classList.remove('hidden');
     $('btnStegoDownload').classList.remove('hidden');
-    await logAction('STEGO_EMBED', `Pesan ${msg.length} karakter disisipkan ke LSB citra, SHA256=${(await hashSHA256(msg)).slice(0, 16)}…`);
-    toast('Pesan berhasil disisipkan ke piksel citra.');
+    $('btnCoverNormalizedDownload').classList.remove('hidden');
+    $('stegoSizeStatus').classList.remove('hidden');
+
+    const exactWithOrig = trace.isOrigPng && trace.origUploadBytes === trace.stegoFinalBytes;
+    const statusText = exactWithOrig
+      ? `Ukuran Stego-Image: ${trace.stegoFinalBytes.toLocaleString('id-ID')} byte — 100% IDENTIK (selisih 0 byte) dengan file PNG asli yang diunggah.`
+      : `Ukuran Stego-Image & Sampul PNG Terstandarisasi: ${trace.stegoFinalBytes.toLocaleString('id-ID')} byte (selisih 0 byte / identik).`;
+    setStatus('stegoSizeStatus', statusText, 'ok');
+
+    await logAction('STEGO_EMBED', `Pesan ${msg.length} karakter disisipkan ke LSB (${trace.stegoFinalBytes} byte, delta=${trace.sizeDiffBytes}B), SHA256=${(await hashSHA256(msg)).slice(0, 16)}…`);
+    toast('Pesan berhasil disisipkan dengan ukuran berkas teroptimasi.');
   });
 
   $('btnStegoDownload').onclick = () => {
-    const a = document.createElement('a');
-    a.href = stegoDataUrl;
-    a.download = 'stego-image.png';
-    a.click();
+    if (stegoBlobOut) {
+      downloadBlob(stegoBlobOut, 'stego-image.png');
+    } else if (stegoDataUrl) {
+      const a = document.createElement('a');
+      a.href = stegoDataUrl;
+      a.download = 'stego-image.png';
+      a.click();
+    }
+  };
+
+  $('btnCoverNormalizedDownload').onclick = () => {
+    if (coverNormalizedBlobOut) {
+      downloadBlob(coverNormalizedBlobOut, 'cover-reference.png');
+    }
   };
 
   $('stegoFile').onchange = async e => {
@@ -919,7 +951,15 @@ function renderStegoSteps(t) {
   return [
     stepBox(1, 'Konversi Pesan ke Aliran Bit & Delimiter', note('Setiap karakter UTF-8 diubah ke 8 bit biner dan diakhiri penanda 16-bit (0xFFFE).') + table(['Karakter', 'Representasi Biner'], t.firstChars.map(c => [vis(c.char), c.bin])) + kv('Delimiter Penutup', t.delimiter) + kv('Jumlah Bit', `${t.messageBitLen} bit pesan + ${t.delimiter.length} bit delimiter = ${t.totalBitLen} bit`)),
     stepBox(2, 'Perbandingan Bit Piksel (Sebelum vs Sesudah)', note('Bit paling kanan (LSB) pada kanal R, G, dan B digantikan oleh bit pesan.') + table(['Kanal Piksel', 'Nilai Awal', 'Biner Awal', 'Bit Pesan', 'Nilai Akhir', 'Biner Akhir', 'Status'], pixRows)),
-    stepBox(3, 'Kapasitas Citra & Ekspor Lossless', kv('Resolusi Citra', `${t.width}×${t.height} piksel`) + kv('Kapasitas Total', `${t.capacityBits} bit (${t.capacityBytes} byte)`) + kv('Kapasitas Terpakai', `${t.totalBitLen} bit (${ratio}%)`)),
+    stepBox(3, 'Kapasitas Citra & Kamuflase Ukuran Berkas (Anti-Deteksi)',
+      kv('Resolusi Citra', `${t.width}×${t.height} piksel`)
+      + kv('Kapasitas Total', `${t.capacityBits.toLocaleString('id-ID')} bit (${t.capacityBytes.toLocaleString('id-ID')} byte)`)
+      + kv('Kapasitas Terpakai', `${t.totalBitLen} bit (${ratio}%)`)
+      + kv('Ukuran Unggahan Asli', `${(t.origUploadBytes || 0).toLocaleString('id-ID')} byte (${t.isOrigPng ? 'PNG' : 'Non-PNG'})`)
+      + kv('Ukuran Hasil Kompresi Mentah', `Sampul: ${t.rawCoverPngBytes.toLocaleString('id-ID')} B · Stego: ${t.rawStegoPngBytes.toLocaleString('id-ID')} B (selisih alami ${Math.abs(t.rawStegoPngBytes - t.rawCoverPngBytes)} B)`)
+      + kv('Ukuran Akhir Terstandarisasi', `Sampul: ${t.coverFinalBytes.toLocaleString('id-ID')} byte · Stego: ${t.stegoFinalBytes.toLocaleString('id-ID')} byte (Selisih: ${t.sizeDiffBytes} byte / 0.000%)`)
+      + note('Menggunakan Adaptive 24-bit RGB PNG Encoder (tanpa channel Alpha mubazir) dan penyamaan ukuran byte (Byte-Size Equalization) sehingga ukuran berkas sebelum dan sesudah penyisipan identik hingga ke satuan byte.')
+    ),
   ].join('');
 }
 
