@@ -1,9 +1,9 @@
 /**
  * crypto.js — Secret Note
- * SHA-256, Vigenère klasik (A-Z, mod 26), AES-256-GCM (modern) dan Super-Enkripsi dua lapis,
- * lengkap dengan "trace" langkah demi langkah untuk visualisasi presentasi.
- *   Enkripsi : Plaintext -> Vigenère -> AES-256-GCM -> Base64
- *   Dekripsi : Base64 -> AES-256-GCM -> Vigenère decrypt -> Plaintext
+ * SHA-256, Vigenère klasik (A-Z, mod 26), AES-256-GCM (modern + AAD Owner Binding)
+ * dan Super-Enkripsi dua lapis lengkap dengan trace langkah untuk visualisasi.
+ *   Enkripsi : Plaintext -> Vigenère (A-Z mod 26) -> AES-256-GCM (AAD=username) -> Base64
+ *   Dekripsi : Base64 -> AES-256-GCM (verifikasi AAD=username & Auth Tag) -> Vigenère -> Plaintext
  */
 'use strict';
 
@@ -45,17 +45,12 @@ async function hashSHA256(data) {
 // Huruf kecil tetap kecil, huruf besar tetap besar. Angka, spasi, dan simbol
 // dilewatkan apa adanya (pass-through) dan TIDAK memajukan indeks kunci.
 
-/** Membersihkan kunci: hanya huruf A-Z (huruf besar). */
 function normalizeVigenereKey(key) {
   const k = String(key || '').toUpperCase().replace(/[^A-Z]/g, '');
-  if (!k) throw new Error('Kunci Vigenère harus mengandung minimal 1 huruf A-Z.');
+  if (!k) throw new Error('Kunci Vigenère harus mengandung minimal 1 huruf alfabet (A–Z).');
   return k;
 }
 
-/**
- * @returns {{text:string, key:string, steps:Array}}
- *   steps: [{ char, code, isAlpha, keyChar, keyShift, p, c, resChar, resCode }]
- */
 function _vigenereCore(text, key, dir) {
   const k = normalizeVigenereKey(key);
   let ki = 0;
@@ -88,7 +83,7 @@ const vigenereDecryptTrace = (c, k) => _vigenereCore(c, k, -1);
 const vigenereEncrypt = (plaintext, key) => _vigenereCore(plaintext, key, 1).text;
 const vigenereDecrypt = (ciphertext, key) => _vigenereCore(ciphertext, key, -1).text;
 
-// ── AES-256-GCM (kunci diturunkan dengan PBKDF2) ─────────────────────────────
+// ── AES-256-GCM (PBKDF2 + Additional Authenticated Data / AAD) ───────────────
 async function _deriveBits(password, salt) {
   const base = await crypto.subtle.importKey('raw', strToBytes(password), 'PBKDF2', false, ['deriveBits']);
   return new Uint8Array(await crypto.subtle.deriveBits(
@@ -96,14 +91,23 @@ async function _deriveBits(password, salt) {
 }
 const _aesKeyFromBits = (bits) => crypto.subtle.importKey('raw', bits, 'AES-GCM', false, ['encrypt', 'decrypt']);
 
+function _buildGcmParams(iv, ownerUsername) {
+  const params = { name: 'AES-GCM', iv };
+  if (ownerUsername) {
+    params.additionalData = strToBytes(`SECRETNOTE-OWNER:${ownerUsername}`);
+  }
+  return params;
+}
+
 /** Output Base64: [salt(16) | iv(12) | ciphertext+tag] + detail langkah. */
-async function aesEncryptTrace(plaintext, key) {
+async function aesEncryptTrace(plaintext, key, ownerUsername = '') {
   if (!key) throw new Error('Kunci AES tidak boleh kosong.');
   const salt = crypto.getRandomValues(new Uint8Array(AES_SALT_BYTES));
   const iv = crypto.getRandomValues(new Uint8Array(AES_IV_BYTES));
   const keyBits = await _deriveBits(key, salt);
   const k = await _aesKeyFromBits(keyBits);
-  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, strToBytes(plaintext)));
+  const gcmParams = _buildGcmParams(iv, ownerUsername);
+  const ct = new Uint8Array(await crypto.subtle.encrypt(gcmParams, k, strToBytes(plaintext)));
   const payload = new Uint8Array(salt.length + iv.length + ct.length);
   payload.set(salt, 0);
   payload.set(iv, salt.length);
@@ -111,6 +115,7 @@ async function aesEncryptTrace(plaintext, key) {
   return {
     b64: bytesToBase64(payload),
     iterations: PBKDF2_ITERATIONS,
+    aadLabel: ownerUsername ? `SECRETNOTE-OWNER:${ownerUsername}` : '(tanpa AAD)',
     saltHex: bytesToHex(salt),
     ivHex: bytesToHex(iv),
     keyHex: bytesToHex(keyBits),
@@ -121,25 +126,27 @@ async function aesEncryptTrace(plaintext, key) {
   };
 }
 
-async function aesDecryptTrace(ciphertextB64, key) {
+async function aesDecryptTrace(ciphertextB64, key, ownerUsername = '') {
   if (!key) throw new Error('Kunci AES tidak boleh kosong.');
   let payload;
   try { payload = base64ToBytes(ciphertextB64.trim()); } catch { throw new Error('Ciphertext bukan Base64 yang valid.'); }
-  if (payload.length < AES_SALT_BYTES + AES_IV_BYTES + AES_TAG_BYTES) throw new Error('Ciphertext terlalu pendek / rusak.');
+  if (payload.length < AES_SALT_BYTES + AES_IV_BYTES + AES_TAG_BYTES) throw new Error('Ciphertext terlalu pendek atau rusak.');
   const salt = payload.slice(0, AES_SALT_BYTES);
   const iv = payload.slice(AES_SALT_BYTES, AES_SALT_BYTES + AES_IV_BYTES);
   const data = payload.slice(AES_SALT_BYTES + AES_IV_BYTES);
   const keyBits = await _deriveBits(key, salt);
   const k = await _aesKeyFromBits(keyBits);
+  const gcmParams = _buildGcmParams(iv, ownerUsername);
   let plain;
   try {
-    plain = new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, k, data));
+    plain = new TextDecoder().decode(await crypto.subtle.decrypt(gcmParams, k, data));
   } catch {
-    throw new Error('Dekripsi AES gagal: kunci salah atau data rusak.');
+    throw new Error('Dekripsi AES-GCM ditolak: kunci salah, pemilik akun (AAD) berbeda, atau data telah dimodifikasi.');
   }
   return {
     plain,
     iterations: PBKDF2_ITERATIONS,
+    aadLabel: ownerUsername ? `SECRETNOTE-OWNER:${ownerUsername}` : '(tanpa AAD)',
     saltHex: bytesToHex(salt),
     ivHex: bytesToHex(iv),
     keyHex: bytesToHex(keyBits),
@@ -149,30 +156,28 @@ async function aesDecryptTrace(ciphertextB64, key) {
   };
 }
 
-const aesEncrypt = async (plaintext, key) => (await aesEncryptTrace(plaintext, key)).b64;
-const aesDecrypt = async (ciphertextB64, key) => (await aesDecryptTrace(ciphertextB64, key)).plain;
+const aesEncrypt = async (plaintext, key, ownerUsername = '') => (await aesEncryptTrace(plaintext, key, ownerUsername)).b64;
+const aesDecrypt = async (ciphertextB64, key, ownerUsername = '') => (await aesDecryptTrace(ciphertextB64, key, ownerUsername)).plain;
 
 // ── Super-Enkripsi ───────────────────────────────────────────────────────────
-/** @returns {{plaintext, vigText, vigSteps, aes}} */
-async function superEncryptTrace(plaintext, vigenereKey, aesKey) {
+async function superEncryptTrace(plaintext, vigenereKey, aesKey, ownerUsername = '') {
   const vig = vigenereEncryptTrace(plaintext, vigenereKey);
-  const aes = await aesEncryptTrace(vig.text, aesKey);
+  const aes = await aesEncryptTrace(vig.text, aesKey, ownerUsername);
   return { plaintext, vigKey: vig.key, vigText: vig.text, vigSteps: vig.steps, aes };
 }
 
-/** @returns {{aes, vigCipher, vigSteps, plain}} */
-async function superDecryptTrace(ciphertext, vigenereKey, aesKey) {
-  const aes = await aesDecryptTrace(ciphertext, aesKey);
+async function superDecryptTrace(ciphertext, vigenereKey, aesKey, ownerUsername = '') {
+  const aes = await aesDecryptTrace(ciphertext, aesKey, ownerUsername);
   const vig = vigenereDecryptTrace(aes.plain, vigenereKey);
   return { aes, vigKey: vig.key, vigCipher: aes.plain, vigSteps: vig.steps, plain: vig.text };
 }
 
-async function superEncrypt(text, vigenereKey, aesKey) {
-  const r = await superEncryptTrace(text, vigenereKey, aesKey);
+async function superEncrypt(text, vigenereKey, aesKey, ownerUsername = '') {
+  const r = await superEncryptTrace(text, vigenereKey, aesKey, ownerUsername);
   return { vigenere: r.vigText, aes: r.aes.b64 };
 }
 
-async function superDecrypt(ciphertext, vigenereKey, aesKey) {
-  const r = await superDecryptTrace(ciphertext, vigenereKey, aesKey);
+async function superDecrypt(ciphertext, vigenereKey, aesKey, ownerUsername = '') {
+  const r = await superDecryptTrace(ciphertext, vigenereKey, aesKey, ownerUsername);
   return { vigenere: r.vigCipher, plain: r.plain };
 }

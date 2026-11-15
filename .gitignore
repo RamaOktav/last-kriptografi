@@ -1,5 +1,9 @@
 # Development / AI Prompts
 base.md
+audit.md
 *.key
+*.db
+*.db-shm
+*.db-wal
 .DS_Store
 Thumbs.db
